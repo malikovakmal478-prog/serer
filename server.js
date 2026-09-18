@@ -1,14 +1,4 @@
-/*
-  NOVAIX — ONE FILE SERVER
-  Node.js 20+
-  Render ready
-
-  Required:
-    DATABASE_URL
-
-  Optional:
-    JWT_SECRET
-*/
+"use strict";
 
 const express = require("express");
 const { Pool } = require("pg");
@@ -18,35 +8,10 @@ const jwt = require("jsonwebtoken");
 const app = express();
 
 const PORT = Number(process.env.PORT) || 10000;
-
+const NODE_ENV = process.env.NODE_ENV || "production";
+const DATABASE_URL = process.env.DATABASE_URL || "";
 const JWT_SECRET =
-  process.env.JWT_SECRET ||
-  "novaix-development-secret-change-this";
-
-const DATABASE_URL = process.env.DATABASE_URL;
-
-/* =========================================================
-   EXPRESS
-========================================================= */
-
-app.disable("x-powered-by");
-
-app.use(
-  express.json({
-    limit: "20mb"
-  })
-);
-
-app.use(
-  express.urlencoded({
-    extended: true,
-    limit: "20mb"
-  })
-);
-
-/* =========================================================
-   DATABASE
-========================================================= */
+  process.env.JWT_SECRET || "novaix-development-secret-change-this";
 
 let pool = null;
 
@@ -55,7 +20,10 @@ if (DATABASE_URL) {
     connectionString: DATABASE_URL,
     ssl: {
       rejectUnauthorized: false
-    }
+    },
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000
   });
 
   pool.on("error", (error) => {
@@ -64,25 +32,15 @@ if (DATABASE_URL) {
 
   console.log("PostgreSQL: configured");
 } else {
-  console.warn(
-    "WARNING: DATABASE_URL is not configured."
-  );
+  console.warn("WARNING: DATABASE_URL is not configured.");
 }
+
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
 /* =========================================================
-   DATABASE HELPERS
+   DATABASE
 ========================================================= */
-
-function requireDatabase(req, res, next) {
-  if (!pool) {
-    return res.status(503).json({
-      error:
-        "Database is not configured. Add DATABASE_URL in Render."
-    });
-  }
-
-  next();
-}
 
 async function initDatabase() {
   if (!pool) {
@@ -95,84 +53,68 @@ async function initDatabase() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
-      username VARCHAR(50) UNIQUE NOT NULL,
+      username VARCHAR(30) UNIQUE NOT NULL,
       email VARCHAR(255) UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
+      full_name VARCHAR(120) DEFAULT '',
       bio TEXT DEFAULT '',
       avatar TEXT DEFAULT '',
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS repositories (
       id SERIAL PRIMARY KEY,
-      owner_id INTEGER NOT NULL
-        REFERENCES users(id)
-        ON DELETE CASCADE,
+      owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       name VARCHAR(100) NOT NULL,
       description TEXT DEFAULT '',
-      visibility VARCHAR(20) DEFAULT 'public',
-      default_branch VARCHAR(100) DEFAULT 'main',
-      stars INTEGER DEFAULT 0,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      visibility VARCHAR(20) NOT NULL DEFAULT 'public',
+      stars INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
       UNIQUE(owner_id, name)
     );
 
     CREATE TABLE IF NOT EXISTS repo_files (
       id SERIAL PRIMARY KEY,
-      repo_id INTEGER NOT NULL
-        REFERENCES repositories(id)
-        ON DELETE CASCADE,
+      repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
       file_path TEXT NOT NULL,
-      content TEXT DEFAULT '',
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      content TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
       UNIQUE(repo_id, file_path)
     );
 
     CREATE TABLE IF NOT EXISTS commits (
       id SERIAL PRIMARY KEY,
-      repo_id INTEGER NOT NULL
-        REFERENCES repositories(id)
-        ON DELETE CASCADE,
-      author_id INTEGER
-        REFERENCES users(id)
-        ON DELETE SET NULL,
+      repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+      author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       message TEXT NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS issues (
       id SERIAL PRIMARY KEY,
-      repo_id INTEGER NOT NULL
-        REFERENCES repositories(id)
-        ON DELETE CASCADE,
-      author_id INTEGER
-        REFERENCES users(id)
-        ON DELETE SET NULL,
-      title TEXT NOT NULL,
+      repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+      author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title VARCHAR(200) NOT NULL,
       body TEXT DEFAULT '',
-      state VARCHAR(20) DEFAULT 'open',
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      status VARCHAR(20) NOT NULL DEFAULT 'open',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS stars (
       id SERIAL PRIMARY KEY,
-      repo_id INTEGER NOT NULL
-        REFERENCES repositories(id)
-        ON DELETE CASCADE,
-      user_id INTEGER NOT NULL
-        REFERENCES users(id)
-        ON DELETE CASCADE,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(repo_id, user_id)
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(user_id, repo_id)
     );
 
     CREATE TABLE IF NOT EXISTS sessions (
       id SERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL
-        REFERENCES users(id)
-        ON DELETE CASCADE,
-      token TEXT NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token TEXT UNIQUE NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE INDEX IF NOT EXISTS idx_repositories_owner
@@ -189,16 +131,29 @@ async function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_stars_repo
       ON stars(repo_id);
+
+    CREATE INDEX IF NOT EXISTS idx_stars_user
+      ON stars(user_id);
   `);
 
   console.log("Database initialized.");
 }
 
 /* =========================================================
-   AUTH
+   HELPERS
 ========================================================= */
 
-function createToken(user) {
+function requireDatabase(req, res, next) {
+  if (!pool) {
+    return res.status(503).json({
+      error: "Database is not configured."
+    });
+  }
+
+  next();
+}
+
+function makeToken(user) {
   return jwt.sign(
     {
       id: user.id,
@@ -213,8 +168,7 @@ function createToken(user) {
 }
 
 function auth(req, res, next) {
-  const header =
-    req.headers.authorization || "";
+  const header = req.headers.authorization || "";
 
   if (!header.startsWith("Bearer ")) {
     return res.status(401).json({
@@ -222,26 +176,133 @@ function auth(req, res, next) {
     });
   }
 
-  const token = header.substring(7).trim();
+  const token = header.slice(7).trim();
 
   if (!token) {
     return res.status(401).json({
-      error: "Authentication required."
+      error: "Authentication token is missing."
     });
   }
 
   try {
-    req.user = jwt.verify(
-      token,
-      JWT_SECRET
-    );
-
+    req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch (error) {
     return res.status(401).json({
-      error: "Invalid or expired session."
+      error: "Invalid or expired token."
     });
   }
+}
+
+function optionalAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+
+  if (!header.startsWith("Bearer ")) {
+    return next();
+  }
+
+  const token = header.slice(7).trim();
+
+  if (!token) {
+    return next();
+  }
+
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+  } catch (error) {
+    req.user = null;
+  }
+
+  next();
+}
+
+function normalizeUsername(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeEmail(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeRepoName(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, "-");
+}
+
+function normalizeFilePath(value) {
+  let filePath = String(value || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "");
+
+  const parts = filePath.split("/");
+
+  if (
+    !filePath ||
+    filePath.length > 500 ||
+    parts.some((part) => !part || part === "." || part === "..")
+  ) {
+    return null;
+  }
+
+  return filePath;
+}
+
+function publicUser(row) {
+  return {
+    id: row.id,
+    username: row.username,
+    full_name: row.full_name || "",
+    bio: row.bio || "",
+    avatar: row.avatar || "",
+    created_at: row.created_at
+  };
+}
+
+function publicRepo(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description || "",
+    visibility: row.visibility,
+    stars: Number(row.stars || 0),
+    created_at: row.created_at,
+    owner: {
+      id: row.owner_id,
+      username: row.owner_username
+    }
+  };
+}
+
+async function findRepository(repoId) {
+  const result = await pool.query(
+    `
+    SELECT
+      r.*,
+      u.username AS owner_username
+    FROM repositories r
+    JOIN users u ON u.id = r.owner_id
+    WHERE r.id = $1
+    `,
+    [repoId]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function canAccessRepository(repo, userId) {
+  if (!repo) return false;
+
+  if (repo.visibility === "public") {
+    return true;
+  }
+
+  return Boolean(userId && Number(repo.owner_id) === Number(userId));
 }
 
 /* =========================================================
@@ -256,749 +317,551 @@ app.get("/api/health", async (req, res) => {
       await pool.query("SELECT 1");
       database = true;
     } catch (error) {
-      console.error(
-        "Health database error:",
-        error.message
-      );
+      database = false;
     }
   }
 
   res.json({
     ok: true,
-    server: "NOVAIX",
-    database,
-    environment:
-      process.env.NODE_ENV || "production",
-    time: new Date().toISOString()
+    service: "NOVAIX",
+    environment: NODE_ENV,
+    database
   });
+});
+
+/*
+  Everything below this point that uses PostgreSQL requires DB.
+*/
+app.use("/api", (req, res, next) => {
+  if (req.path === "/health") {
+    return next();
+  }
+
+  return requireDatabase(req, res, next);
 });
 
 /* =========================================================
    REGISTER
 ========================================================= */
 
-app.post(
-  "/api/register",
-  requireDatabase,
-  async (req, res) => {
-    try {
-      let username = String(
-        req.body.username || ""
-      ).trim();
+app.post("/api/register", async (req, res) => {
+  try {
+    const fullName = String(req.body.fullName || "").trim();
+    const username = normalizeUsername(req.body.username);
+    const email = normalizeEmail(req.body.email);
+    const password = String(req.body.password || "");
 
-      let email = String(
-        req.body.email || ""
-      )
-        .trim()
-        .toLowerCase();
-
-      const password = String(
-        req.body.password || ""
-      );
-
-      if (
-        !/^[a-zA-Z0-9_]{3,30}$/.test(
-          username
-        )
-      ) {
-        return res.status(400).json({
-          error:
-            "Username must contain 3-30 letters, numbers or underscore."
-        });
-      }
-
-      if (
-        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
-          email
-        )
-      ) {
-        return res.status(400).json({
-          error: "Invalid email."
-        });
-      }
-
-      if (password.length < 6) {
-        return res.status(400).json({
-          error:
-            "Password must contain at least 6 characters."
-        });
-      }
-
-      const existing =
-        await pool.query(
-          `
-          SELECT id
-          FROM users
-          WHERE username = $1
-             OR email = $2
-          `,
-          [username, email]
-        );
-
-      if (existing.rows.length > 0) {
-        return res.status(409).json({
-          error:
-            "Username or email already exists."
-        });
-      }
-
-      const hash =
-        await bcrypt.hash(
-          password,
-          12
-        );
-
-      const result =
-        await pool.query(
-          `
-          INSERT INTO users
-          (
-            username,
-            email,
-            password_hash
-          )
-          VALUES ($1, $2, $3)
-          RETURNING
-            id,
-            username,
-            email,
-            bio,
-            avatar,
-            created_at
-          `,
-          [
-            username,
-            email,
-            hash
-          ]
-        );
-
-      const user =
-        result.rows[0];
-
-      const token =
-        createToken(user);
-
-      await pool.query(
-        `
-        INSERT INTO sessions
-        (
-          user_id,
-          token
-        )
-        VALUES ($1, $2)
-        `,
-        [
-          user.id,
-          token
-        ]
-      );
-
-      return res.status(201).json({
-        ok: true,
-        token,
-        user
-      });
-    } catch (error) {
-      console.error(
-        "Registration error:",
-        error
-      );
-
-      return res.status(500).json({
-        error:
-          "Registration failed."
+    if (!username || !email || !password) {
+      return res.status(400).json({
+        error: "Username, email and password are required."
       });
     }
+
+    if (!/^[a-z0-9_]{3,30}$/.test(username)) {
+      return res.status(400).json({
+        error:
+          "Username must be 3-30 characters and contain only letters, numbers or underscore."
+      });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({
+        error: "Please enter a valid email."
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        error: "Password must contain at least 6 characters."
+      });
+    }
+
+    const existing = await pool.query(
+      `
+      SELECT id
+      FROM users
+      WHERE username = $1 OR email = $2
+      LIMIT 1
+      `,
+      [username, email]
+    );
+
+    if (existing.rows.length) {
+      return res.status(409).json({
+        error: "Username or email already exists."
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+
+    const result = await pool.query(
+      `
+      INSERT INTO users (
+        username,
+        email,
+        password_hash,
+        full_name
+      )
+      VALUES ($1, $2, $3, $4)
+      RETURNING
+        id,
+        username,
+        email,
+        full_name,
+        bio,
+        avatar,
+        created_at
+      `,
+      [username, email, passwordHash, fullName]
+    );
+
+    const user = result.rows[0];
+    const token = makeToken(user);
+
+    await pool.query(
+      `
+      INSERT INTO sessions (user_id, token)
+      VALUES ($1, $2)
+      `,
+      [user.id, token]
+    );
+
+    return res.status(201).json({
+      ok: true,
+      token,
+      user: publicUser(user)
+    });
+  } catch (error) {
+    console.error("REGISTER ERROR:", error);
+
+    if (error.code === "23505") {
+      return res.status(409).json({
+        error: "Username or email already exists."
+      });
+    }
+
+    return res.status(500).json({
+      error: "Registration failed."
+    });
   }
-);
+});
 
 /* =========================================================
    LOGIN
 ========================================================= */
 
-app.post(
-  "/api/login",
-  requireDatabase,
-  async (req, res) => {
-    try {
-      const email = String(
-        req.body.email || ""
-      )
-        .trim()
-        .toLowerCase();
+app.post("/api/login", async (req, res) => {
+  try {
+    const login = String(req.body.login || "").trim().toLowerCase();
+    const password = String(req.body.password || "");
 
-      const password = String(
-        req.body.password || ""
-      );
-
-      if (!email || !password) {
-        return res.status(400).json({
-          error:
-            "Email and password are required."
-        });
-      }
-
-      const result =
-        await pool.query(
-          `
-          SELECT *
-          FROM users
-          WHERE email = $1
-          LIMIT 1
-          `,
-          [email]
-        );
-
-      if (result.rows.length === 0) {
-        return res.status(401).json({
-          error:
-            "Invalid email or password."
-        });
-      }
-
-      const user =
-        result.rows[0];
-
-      const valid =
-        await bcrypt.compare(
-          password,
-          user.password_hash
-        );
-
-      if (!valid) {
-        return res.status(401).json({
-          error:
-            "Invalid email or password."
-        });
-      }
-
-      const token =
-        createToken(user);
-
-      await pool.query(
-        `
-        INSERT INTO sessions
-        (
-          user_id,
-          token
-        )
-        VALUES ($1, $2)
-        `,
-        [
-          user.id,
-          token
-        ]
-      );
-
-      delete user.password_hash;
-
-      return res.json({
-        ok: true,
-        token,
-        user
-      });
-    } catch (error) {
-      console.error(
-        "Login error:",
-        error
-      );
-
-      return res.status(500).json({
-        error: "Login failed."
+    if (!login || !password) {
+      return res.status(400).json({
+        error: "Login and password are required."
       });
     }
+
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        username,
+        email,
+        password_hash,
+        full_name,
+        bio,
+        avatar,
+        created_at
+      FROM users
+      WHERE username = $1 OR email = $1
+      LIMIT 1
+      `,
+      [login]
+    );
+
+    if (!result.rows.length) {
+      return res.status(401).json({
+        error: "Invalid login or password."
+      });
+    }
+
+    const user = result.rows[0];
+
+    const valid = await bcrypt.compare(
+      password,
+      user.password_hash
+    );
+
+    if (!valid) {
+      return res.status(401).json({
+        error: "Invalid login or password."
+      });
+    }
+
+    const token = makeToken(user);
+
+    await pool.query(
+      `
+      INSERT INTO sessions (user_id, token)
+      VALUES ($1, $2)
+      `,
+      [user.id, token]
+    );
+
+    return res.json({
+      ok: true,
+      token,
+      user: publicUser(user)
+    });
+  } catch (error) {
+    console.error("LOGIN ERROR:", error);
+
+    return res.status(500).json({
+      error: "Login failed."
+    });
   }
-);
+});
 
 /* =========================================================
    LOGOUT
 ========================================================= */
 
-app.post(
-  "/api/logout",
-  auth,
-  requireDatabase,
-  async (req, res) => {
-    try {
-      const header =
-        req.headers.authorization || "";
+app.post("/api/logout", auth, async (req, res) => {
+  try {
+    const header = req.headers.authorization || "";
+    const token = header.slice(7).trim();
 
-      const token =
-        header.startsWith("Bearer ")
-          ? header.substring(7)
-          : "";
-
-      if (token) {
-        await pool.query(
-          `
-          DELETE FROM sessions
-          WHERE token = $1
-          `,
-          [token]
-        );
-      }
-
-      return res.json({
-        ok: true
-      });
-    } catch (error) {
-      console.error(
-        "Logout error:",
-        error.message
+    if (token) {
+      await pool.query(
+        `
+        DELETE FROM sessions
+        WHERE token = $1
+        `,
+        [token]
       );
-
-      return res.json({
-        ok: true
-      });
     }
+
+    res.json({
+      ok: true
+    });
+  } catch (error) {
+    console.error("LOGOUT ERROR:", error);
+
+    res.status(500).json({
+      error: "Logout failed."
+    });
   }
-);
+});
 
 /* =========================================================
-   CURRENT USER
+   ME
 ========================================================= */
 
-app.get(
-  "/api/me",
-  auth,
-  requireDatabase,
-  async (req, res) => {
-    try {
-      const result =
-        await pool.query(
-          `
-          SELECT
-            id,
-            username,
-            email,
-            bio,
-            avatar,
-            created_at
-          FROM users
-          WHERE id = $1
-          `,
-          [req.user.id]
-        );
+app.get("/api/me", auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        username,
+        email,
+        full_name,
+        bio,
+        avatar,
+        created_at
+      FROM users
+      WHERE id = $1
+      `,
+      [req.user.id]
+    );
 
-      if (result.rows.length === 0) {
-        return res.status(404).json({
-          error: "User not found."
-        });
-      }
-
-      return res.json(
-        result.rows[0]
-      );
-    } catch (error) {
-      console.error(
-        "Me error:",
-        error
-      );
-
-      return res.status(500).json({
-        error:
-          "Unable to load profile."
+    if (!result.rows.length) {
+      return res.status(404).json({
+        error: "User not found."
       });
     }
+
+    res.json({
+      user: publicUser(result.rows[0])
+    });
+  } catch (error) {
+    console.error("ME ERROR:", error);
+
+    res.status(500).json({
+      error: "Unable to load account."
+    });
   }
-);
+});
 
 /* =========================================================
    USER PROFILE
 ========================================================= */
 
-app.get(
-  "/api/users/:username",
-  requireDatabase,
-  async (req, res) => {
-    try {
-      const result =
-        await pool.query(
-          `
-          SELECT
-            id,
-            username,
-            email,
-            bio,
-            avatar,
-            created_at
-          FROM users
-          WHERE username = $1
-          `,
-          [req.params.username]
-        );
+app.get("/api/users/:username", async (req, res) => {
+  try {
+    const username = normalizeUsername(req.params.username);
 
-      if (result.rows.length === 0) {
-        return res.status(404).json({
-          error:
-            "User not found."
-        });
-      }
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        username,
+        full_name,
+        bio,
+        avatar,
+        created_at
+      FROM users
+      WHERE username = $1
+      `,
+      [username]
+    );
 
-      const user =
-        result.rows[0];
-
-      const repos =
-        await pool.query(
-          `
-          SELECT
-            id,
-            name,
-            description,
-            visibility,
-            default_branch,
-            stars,
-            created_at
-          FROM repositories
-          WHERE owner_id = $1
-          ORDER BY created_at DESC
-          `,
-          [user.id]
-        );
-
-      return res.json({
-        user,
-        repositories:
-          repos.rows
-      });
-    } catch (error) {
-      console.error(
-        "Profile error:",
-        error
-      );
-
-      return res.status(500).json({
-        error:
-          "Profile loading failed."
+    if (!result.rows.length) {
+      return res.status(404).json({
+        error: "User not found."
       });
     }
+
+    res.json({
+      user: publicUser(result.rows[0])
+    });
+  } catch (error) {
+    console.error("USER PROFILE ERROR:", error);
+
+    res.status(500).json({
+      error: "Unable to load profile."
+    });
   }
-);
+});
 
 /* =========================================================
    CREATE REPOSITORY
 ========================================================= */
 
-app.post(
-  "/api/repos",
-  auth,
-  requireDatabase,
-  async (req, res) => {
-    try {
-      const name =
-        String(
-          req.body.name || ""
-        ).trim();
+app.post("/api/repos", auth, async (req, res) => {
+  try {
+    const name = normalizeRepoName(req.body.name);
+    const description = String(req.body.description || "").trim();
+    const visibility =
+      req.body.visibility === "private" ? "private" : "public";
 
-      const description =
-        String(
-          req.body.description || ""
-        ).trim();
-
-      const visibility =
-        req.body.visibility ===
-        "private"
-          ? "private"
-          : "public";
-
-      if (
-        !/^[a-zA-Z0-9._-]{1,100}$/.test(
-          name
-        )
-      ) {
-        return res.status(400).json({
-          error:
-            "Invalid repository name."
-        });
-      }
-
-      const result =
-        await pool.query(
-          `
-          INSERT INTO repositories
-          (
-            owner_id,
-            name,
-            description,
-            visibility
-          )
-          VALUES ($1, $2, $3, $4)
-          RETURNING *
-          `,
-          [
-            req.user.id,
-            name,
-            description,
-            visibility
-          ]
-        );
-
-      const repo =
-        result.rows[0];
-
-      await pool.query(
-        `
-        INSERT INTO repo_files
-        (
-          repo_id,
-          file_path,
-          content
-        )
-        VALUES ($1, $2, $3)
-        `,
-        [
-          repo.id,
-          "README.md",
-          "# " +
-            name +
-            "\n\n" +
-            description
-        ]
-      );
-
-      await pool.query(
-        `
-        INSERT INTO commits
-        (
-          repo_id,
-          author_id,
-          message
-        )
-        VALUES ($1, $2, $3)
-        `,
-        [
-          repo.id,
-          req.user.id,
-          "Initial commit"
-        ]
-      );
-
-      return res.status(201).json(
-        repo
-      );
-    } catch (error) {
-      console.error(
-        "Repository creation error:",
-        error
-      );
-
-      if (
-        error &&
-        error.code === "23505"
-      ) {
-        return res.status(409).json({
-          error:
-            "Repository already exists."
-        });
-      }
-
-      return res.status(500).json({
-        error:
-          "Repository creation failed."
+    if (!name) {
+      return res.status(400).json({
+        error: "Repository name is required."
       });
     }
+
+    if (!/^[a-zA-Z0-9._-]{1,100}$/.test(name)) {
+      return res.status(400).json({
+        error:
+          "Repository name may contain letters, numbers, dots, hyphens and underscores."
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO repositories (
+        owner_id,
+        name,
+        description,
+        visibility
+      )
+      VALUES ($1, $2, $3, $4)
+      RETURNING *
+      `,
+      [req.user.id, name, description, visibility]
+    );
+
+    res.status(201).json({
+      ok: true,
+      repository: result.rows[0]
+    });
+  } catch (error) {
+    console.error("CREATE REPO ERROR:", error);
+
+    if (error.code === "23505") {
+      return res.status(409).json({
+        error: "You already have a repository with this name."
+      });
+    }
+
+    res.status(500).json({
+      error: "Unable to create repository."
+    });
   }
-);
+});
 
 /* =========================================================
-   LIST PUBLIC REPOSITORIES
+   LIST REPOSITORIES
 ========================================================= */
 
-app.get(
-  "/api/repos",
-  requireDatabase,
-  async (req, res) => {
-    try {
-      const result =
-        await pool.query(`
-          SELECT
-            r.id,
-            r.name,
-            r.description,
-            r.visibility,
-            r.default_branch,
-            r.stars,
-            r.created_at,
-            u.username AS owner
-          FROM repositories r
-          JOIN users u
-            ON u.id = r.owner_id
-          WHERE r.visibility = 'public'
-          ORDER BY r.created_at DESC
-        `);
+app.get("/api/repos", optionalAuth, async (req, res) => {
+  try {
+    const ownerId = req.user ? Number(req.user.id) : null;
 
-      return res.json(
-        result.rows
-      );
-    } catch (error) {
-      console.error(
-        "Repositories error:",
-        error
-      );
+    const result = await pool.query(
+      `
+      SELECT
+        r.id,
+        r.name,
+        r.description,
+        r.visibility,
+        r.stars,
+        r.created_at,
+        r.owner_id,
+        u.username AS owner_username
+      FROM repositories r
+      JOIN users u ON u.id = r.owner_id
+      WHERE
+        r.visibility = 'public'
+        OR ($1::integer IS NOT NULL AND r.owner_id = $1)
+      ORDER BY r.created_at DESC
+      LIMIT 100
+      `,
+      [ownerId]
+    );
 
-      return res.status(500).json({
-        error:
-          "Unable to load repositories."
-      });
-    }
+    res.json({
+      repositories: result.rows.map(publicRepo)
+    });
+  } catch (error) {
+    console.error("LIST REPOS ERROR:", error);
+
+    res.status(500).json({
+      error: "Unable to load repositories."
+    });
   }
-);
+});
 
 /* =========================================================
-   REPOSITORY DETAILS
+   REPOSITORY DETAIL
 ========================================================= */
 
 app.get(
   "/api/repos/:username/:repo",
-  requireDatabase,
+  optionalAuth,
   async (req, res) => {
     try {
-      const result =
-        await pool.query(
-          `
-          SELECT
-            r.*,
-            u.username AS owner
-          FROM repositories r
-          JOIN users u
-            ON u.id = r.owner_id
-          WHERE
-            u.username = $1
-            AND r.name = $2
-          `,
-          [
-            req.params.username,
-            req.params.repo
-          ]
-        );
+      const username = normalizeUsername(req.params.username);
+      const repoName = String(req.params.repo || "").trim();
 
-      if (result.rows.length === 0) {
+      const repoResult = await pool.query(
+        `
+        SELECT
+          r.*,
+          u.username AS owner_username
+        FROM repositories r
+        JOIN users u ON u.id = r.owner_id
+        WHERE u.username = $1
+          AND r.name = $2
+        LIMIT 1
+        `,
+        [username, repoName]
+      );
+
+      if (!repoResult.rows.length) {
         return res.status(404).json({
-          error:
-            "Repository not found."
+          error: "Repository not found."
         });
       }
 
-      const repo =
-        result.rows[0];
+      const repo = repoResult.rows[0];
 
-      if (
-        repo.visibility ===
-        "private"
-      ) {
-        const header =
-          req.headers.authorization ||
-          "";
-
-        if (
-          !header.startsWith(
-            "Bearer "
-          )
-        ) {
-          return res.status(403).json({
-            error:
-              "Private repository."
-          });
-        }
-
-        try {
-          const token =
-            header.substring(7);
-
-          const viewer =
-            jwt.verify(
-              token,
-              JWT_SECRET
-            );
-
-          if (
-            viewer.id !==
-            repo.owner_id
-          ) {
-            return res.status(403).json({
-              error:
-                "Private repository."
-            });
-          }
-        } catch {
-          return res.status(403).json({
-            error:
-              "Private repository."
-          });
-        }
+      if (!(await canAccessRepository(repo, req.user?.id))) {
+        return res.status(403).json({
+          error: "This repository is private."
+        });
       }
 
-      const files =
-        await pool.query(
-          `
-          SELECT
-            id,
-            file_path,
-            content,
-            updated_at
-          FROM repo_files
-          WHERE repo_id = $1
-          ORDER BY file_path
-          `,
-          [repo.id]
-        );
-
-      const commits =
-        await pool.query(
-          `
-          SELECT
-            c.id,
-            c.message,
-            c.created_at,
-            u.username
-          FROM commits c
-          LEFT JOIN users u
-            ON u.id = c.author_id
-          WHERE c.repo_id = $1
-          ORDER BY c.created_at DESC
-          LIMIT 50
-          `,
-          [repo.id]
-        );
-
-      const issues =
-        await pool.query(
-          `
-          SELECT
-            i.id,
-            i.title,
-            i.body,
-            i.state,
-            i.created_at,
-            u.username
-          FROM issues i
-          LEFT JOIN users u
-            ON u.id = i.author_id
-          WHERE i.repo_id = $1
-          ORDER BY i.created_at DESC
-          `,
-          [repo.id]
-        );
-
-      return res.json({
-        repository: repo,
-        files:
-          files.rows,
-        commits:
-          commits.rows,
-        issues:
-          issues.rows
-      });
-    } catch (error) {
-      console.error(
-        "Repository details error:",
-        error
+      const files = await pool.query(
+        `
+        SELECT
+          id,
+          file_path,
+          content,
+          created_at,
+          updated_at
+        FROM repo_files
+        WHERE repo_id = $1
+        ORDER BY file_path ASC
+        `,
+        [repo.id]
       );
 
-      return res.status(500).json({
-        error:
-          "Repository loading failed."
+      const commits = await pool.query(
+        `
+        SELECT
+          c.id,
+          c.message,
+          c.created_at,
+          u.username AS author_username
+        FROM commits c
+        JOIN users u ON u.id = c.author_id
+        WHERE c.repo_id = $1
+        ORDER BY c.created_at DESC
+        LIMIT 50
+        `,
+        [repo.id]
+      );
+
+      const issues = await pool.query(
+        `
+        SELECT
+          i.id,
+          i.title,
+          i.body,
+          i.status,
+          i.created_at,
+          i.updated_at,
+          u.username AS author_username
+        FROM issues i
+        JOIN users u ON u.id = i.author_id
+        WHERE i.repo_id = $1
+        ORDER BY i.created_at DESC
+        LIMIT 100
+        `,
+        [repo.id]
+      );
+
+      let starred = false;
+
+      if (req.user) {
+        const starResult = await pool.query(
+          `
+          SELECT id
+          FROM stars
+          WHERE user_id = $1
+            AND repo_id = $2
+          `,
+          [req.user.id, repo.id]
+        );
+
+        starred = starResult.rows.length > 0;
+      }
+
+      res.json({
+        repository: {
+          id: repo.id,
+          name: repo.name,
+          description: repo.description || "",
+          visibility: repo.visibility,
+          stars: Number(repo.stars || 0),
+          created_at: repo.created_at,
+          owner: {
+            id: repo.owner_id,
+            username: repo.owner_username
+          },
+          starred
+        },
+        files: files.rows,
+        commits: commits.rows,
+        issues: issues.rows
+      });
+    } catch (error) {
+      console.error("REPOSITORY ERROR:", error);
+
+      res.status(500).json({
+        error: "Unable to load repository."
       });
     }
   }
@@ -1008,198 +871,180 @@ app.get(
    SAVE FILE
 ========================================================= */
 
-app.post(
-  "/api/repos/:repoId/files",
-  auth,
-  requireDatabase,
-  async (req, res) => {
-    try {
-      const repoId =
-        Number(req.params.repoId);
+app.post("/api/repos/:repoId/files", auth, async (req, res) => {
+  const repoId = Number(req.params.repoId);
+  const filePath = normalizeFilePath(req.body.filePath);
+  const content = String(req.body.content ?? "");
+  const message =
+    String(req.body.message || "Update file").trim() || "Update file";
 
-      if (
-        !Number.isInteger(repoId) ||
-        repoId <= 0
-      ) {
-        return res.status(400).json({
-          error:
-            "Invalid repository ID."
-        });
-      }
+  if (!Number.isInteger(repoId) || repoId <= 0) {
+    return res.status(400).json({
+      error: "Invalid repository ID."
+    });
+  }
 
-      const filePath =
-        String(
-          req.body.path || ""
-        ).trim();
+  if (!filePath) {
+    return res.status(400).json({
+      error: "Invalid file path."
+    });
+  }
 
-      const content =
-        String(
-          req.body.content || ""
-        );
+  if (content.length > 2_000_000) {
+    return res.status(413).json({
+      error: "File is too large."
+    });
+  }
 
-      if (!filePath) {
-        return res.status(400).json({
-          error:
-            "File path required."
-        });
-      }
+  const client = await pool.connect();
 
-      const repoResult =
-        await pool.query(
-          `
-          SELECT *
-          FROM repositories
-          WHERE id = $1
-          `,
-          [repoId]
-        );
+  try {
+    await client.query("BEGIN");
 
-      if (
-        repoResult.rows.length ===
-        0
-      ) {
-        return res.status(404).json({
-          error:
-            "Repository not found."
-        });
-      }
+    const repoResult = await client.query(
+      `
+      SELECT *
+      FROM repositories
+      WHERE id = $1
+      FOR UPDATE
+      `,
+      [repoId]
+    );
 
-      const repo =
-        repoResult.rows[0];
+    if (!repoResult.rows.length) {
+      await client.query("ROLLBACK");
 
-      if (
-        repo.owner_id !==
-        req.user.id
-      ) {
-        return res.status(403).json({
-          error:
-            "Only repository owner can modify files."
-        });
-      }
-
-      await pool.query(
-        `
-        INSERT INTO repo_files
-        (
-          repo_id,
-          file_path,
-          content
-        )
-        VALUES ($1, $2, $3)
-        ON CONFLICT
-        (
-          repo_id,
-          file_path
-        )
-        DO UPDATE SET
-          content = EXCLUDED.content,
-          updated_at =
-            CURRENT_TIMESTAMP
-        `,
-        [
-          repoId,
-          filePath,
-          content
-        ]
-      );
-
-      await pool.query(
-        `
-        INSERT INTO commits
-        (
-          repo_id,
-          author_id,
-          message
-        )
-        VALUES ($1, $2, $3)
-        `,
-        [
-          repoId,
-          req.user.id,
-          "Update " +
-            filePath
-        ]
-      );
-
-      return res.json({
-        ok: true,
-        path: filePath
-      });
-    } catch (error) {
-      console.error(
-        "File save error:",
-        error
-      );
-
-      return res.status(500).json({
-        error:
-          "File save failed."
+      return res.status(404).json({
+        error: "Repository not found."
       });
     }
+
+    const repo = repoResult.rows[0];
+
+    if (Number(repo.owner_id) !== Number(req.user.id)) {
+      await client.query("ROLLBACK");
+
+      return res.status(403).json({
+        error: "Only the repository owner can edit files."
+      });
+    }
+
+    const result = await client.query(
+      `
+      INSERT INTO repo_files (
+        repo_id,
+        file_path,
+        content
+      )
+      VALUES ($1, $2, $3)
+      ON CONFLICT (repo_id, file_path)
+      DO UPDATE SET
+        content = EXCLUDED.content,
+        updated_at = NOW()
+      RETURNING *
+      `,
+      [repoId, filePath, content]
+    );
+
+    await client.query(
+      `
+      INSERT INTO commits (
+        repo_id,
+        author_id,
+        message
+      )
+      VALUES ($1, $2, $3)
+      `,
+      [repoId, req.user.id, message]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+      file: result.rows[0]
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("SAVE FILE ERROR:", error);
+
+    res.status(500).json({
+      error: "Unable to save file."
+    });
+  } finally {
+    client.release();
   }
-);
+});
 
 /* =========================================================
    GET FILE
 ========================================================= */
 
 app.get(
-  "/api/repos/:repoId/files/*file",
-  requireDatabase,
+  /^\/api\/repos\/(\d+)\/files\/(.+)$/,
+  optionalAuth,
   async (req, res) => {
     try {
-      const repoId =
-        Number(req.params.repoId);
+      const repoId = Number(req.params[0]);
 
-      let filePath =
-        req.params.file;
+      let filePath;
 
-      if (Array.isArray(filePath)) {
-        filePath =
-          filePath.join("/");
-      }
-
-      filePath =
-        String(
-          filePath || ""
-        );
-
-      const result =
-        await pool.query(
-          `
-          SELECT *
-          FROM repo_files
-          WHERE repo_id = $1
-            AND file_path = $2
-          `,
-          [
-            repoId,
-            filePath
-          ]
-        );
-
-      if (
-        result.rows.length ===
-        0
-      ) {
-        return res.status(404).json({
-          error:
-            "File not found."
+      try {
+        filePath = decodeURIComponent(req.params[1]);
+      } catch (error) {
+        return res.status(400).json({
+          error: "Invalid file path."
         });
       }
 
-      return res.json(
-        result.rows[0]
-      );
-    } catch (error) {
-      console.error(
-        "File read error:",
-        error
+      filePath = normalizeFilePath(filePath);
+
+      if (!Number.isInteger(repoId) || repoId <= 0 || !filePath) {
+        return res.status(400).json({
+          error: "Invalid file request."
+        });
+      }
+
+      const repo = await findRepository(repoId);
+
+      if (!repo) {
+        return res.status(404).json({
+          error: "Repository not found."
+        });
+      }
+
+      if (!(await canAccessRepository(repo, req.user?.id))) {
+        return res.status(403).json({
+          error: "This repository is private."
+        });
+      }
+
+      const result = await pool.query(
+        `
+        SELECT *
+        FROM repo_files
+        WHERE repo_id = $1
+          AND file_path = $2
+        LIMIT 1
+        `,
+        [repoId, filePath]
       );
 
-      return res.status(500).json({
-        error:
-          "Unable to read file."
+      if (!result.rows.length) {
+        return res.status(404).json({
+          error: "File not found."
+        });
+      }
+
+      res.json({
+        file: result.rows[0]
+      });
+    } catch (error) {
+      console.error("GET FILE ERROR:", error);
+
+      res.status(500).json({
+        error: "Unable to read file."
       });
     }
   }
@@ -1209,76 +1054,81 @@ app.get(
    STAR REPOSITORY
 ========================================================= */
 
-app.post(
-  "/api/repos/:repoId/star",
-  auth,
-  requireDatabase,
-  async (req, res) => {
-    try {
-      const repoId =
-        Number(req.params.repoId);
+app.post("/api/repos/:repoId/star", auth, async (req, res) => {
+  const repoId = Number(req.params.repoId);
 
-      const exists =
-        await pool.query(
-          `
-          SELECT id
-          FROM stars
-          WHERE repo_id = $1
-            AND user_id = $2
-          `,
-          [
-            repoId,
-            req.user.id
-          ]
-        );
+  if (!Number.isInteger(repoId) || repoId <= 0) {
+    return res.status(400).json({
+      error: "Invalid repository ID."
+    });
+  }
 
-      if (
-        exists.rows.length >
-        0
-      ) {
-        await pool.query(
-          `
-          DELETE FROM stars
-          WHERE repo_id = $1
-            AND user_id = $2
-          `,
-          [
-            repoId,
-            req.user.id
-          ]
-        );
+  const client = await pool.connect();
 
-        await pool.query(
-          `
-          UPDATE repositories
-          SET stars =
-            GREATEST(stars - 1, 0)
-          WHERE id = $1
-          `,
-          [repoId]
-        );
+  try {
+    await client.query("BEGIN");
 
-        return res.json({
-          starred: false
-        });
-      }
+    const repoResult = await client.query(
+      `
+      SELECT id, stars
+      FROM repositories
+      WHERE id = $1
+      FOR UPDATE
+      `,
+      [repoId]
+    );
 
-      await pool.query(
+    if (!repoResult.rows.length) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        error: "Repository not found."
+      });
+    }
+
+    const existing = await client.query(
+      `
+      SELECT id
+      FROM stars
+      WHERE user_id = $1
+        AND repo_id = $2
+      `,
+      [req.user.id, repoId]
+    );
+
+    let starred;
+
+    if (existing.rows.length) {
+      await client.query(
         `
-        INSERT INTO stars
-        (
-          repo_id,
-          user_id
-        )
-        VALUES ($1, $2)
+        DELETE FROM stars
+        WHERE user_id = $1
+          AND repo_id = $2
         `,
-        [
-          repoId,
-          req.user.id
-        ]
+        [req.user.id, repoId]
       );
 
-      await pool.query(
+      await client.query(
+        `
+        UPDATE repositories
+        SET stars = GREATEST(stars - 1, 0)
+        WHERE id = $1
+        `,
+        [repoId]
+      );
+
+      starred = false;
+    } else {
+      await client.query(
+        `
+        INSERT INTO stars (user_id, repo_id)
+        VALUES ($1, $2)
+        ON CONFLICT (user_id, repo_id) DO NOTHING
+        `,
+        [req.user.id, repoId]
+      );
+
+      await client.query(
         `
         UPDATE repositories
         SET stars = stars + 1
@@ -1287,251 +1137,256 @@ app.post(
         [repoId]
       );
 
-      return res.json({
-        starred: true
-      });
-    } catch (error) {
-      console.error(
-        "Star error:",
-        error
-      );
-
-      return res.status(500).json({
-        error:
-          "Star operation failed."
-      });
+      starred = true;
     }
+
+    const updated = await client.query(
+      `
+      SELECT stars
+      FROM repositories
+      WHERE id = $1
+      `,
+      [repoId]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+      starred,
+      stars: Number(updated.rows[0].stars)
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("STAR ERROR:", error);
+
+    res.status(500).json({
+      error: "Unable to update star."
+    });
+  } finally {
+    client.release();
   }
-);
+});
 
 /* =========================================================
    CREATE ISSUE
 ========================================================= */
 
-app.post(
-  "/api/repos/:repoId/issues",
-  auth,
-  requireDatabase,
-  async (req, res) => {
-    try {
-      const repoId =
-        Number(req.params.repoId);
+app.post("/api/repos/:repoId/issues", auth, async (req, res) => {
+  try {
+    const repoId = Number(req.params.repoId);
+    const title = String(req.body.title || "").trim();
+    const body = String(req.body.body || "").trim();
 
-      const title =
-        String(
-          req.body.title || ""
-        ).trim();
-
-      const body =
-        String(
-          req.body.body || ""
-        ).trim();
-
-      if (!title) {
-        return res.status(400).json({
-          error:
-            "Issue title required."
-        });
-      }
-
-      const repo =
-        await pool.query(
-          `
-          SELECT id
-          FROM repositories
-          WHERE id = $1
-          `,
-          [repoId]
-        );
-
-      if (
-        repo.rows.length ===
-        0
-      ) {
-        return res.status(404).json({
-          error:
-            "Repository not found."
-        });
-      }
-
-      const result =
-        await pool.query(
-          `
-          INSERT INTO issues
-          (
-            repo_id,
-            author_id,
-            title,
-            body
-          )
-          VALUES ($1, $2, $3, $4)
-          RETURNING *
-          `,
-          [
-            repoId,
-            req.user.id,
-            title,
-            body
-          ]
-        );
-
-      return res.status(201).json(
-        result.rows[0]
-      );
-    } catch (error) {
-      console.error(
-        "Issue creation error:",
-        error
-      );
-
-      return res.status(500).json({
-        error:
-          "Issue creation failed."
+    if (!Number.isInteger(repoId) || repoId <= 0) {
+      return res.status(400).json({
+        error: "Invalid repository ID."
       });
     }
+
+    if (!title) {
+      return res.status(400).json({
+        error: "Issue title is required."
+      });
+    }
+
+    if (title.length > 200) {
+      return res.status(400).json({
+        error: "Issue title is too long."
+      });
+    }
+
+    const repo = await findRepository(repoId);
+
+    if (!repo) {
+      return res.status(404).json({
+        error: "Repository not found."
+      });
+    }
+
+    if (!(await canAccessRepository(repo, req.user.id))) {
+      return res.status(403).json({
+        error: "You cannot access this repository."
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO issues (
+        repo_id,
+        author_id,
+        title,
+        body
+      )
+      VALUES ($1, $2, $3, $4)
+      RETURNING *
+      `,
+      [repoId, req.user.id, title, body]
+    );
+
+    res.status(201).json({
+      ok: true,
+      issue: result.rows[0]
+    });
+  } catch (error) {
+    console.error("CREATE ISSUE ERROR:", error);
+
+    res.status(500).json({
+      error: "Unable to create issue."
+    });
   }
-);
+});
 
 /* =========================================================
    UPDATE ISSUE
 ========================================================= */
 
-app.patch(
-  "/api/issues/:id",
-  auth,
-  requireDatabase,
-  async (req, res) => {
-    try {
-      const id =
-        Number(req.params.id);
+app.patch("/api/issues/:id", auth, async (req, res) => {
+  try {
+    const issueId = Number(req.params.id);
+    const status = String(req.body.status || "").toLowerCase();
 
-      const state =
-        req.body.state ===
-        "closed"
-          ? "closed"
-          : "open";
-
-      const result =
-        await pool.query(
-          `
-          UPDATE issues
-          SET state = $1
-          WHERE id = $2
-          RETURNING *
-          `,
-          [
-            state,
-            id
-          ]
-        );
-
-      if (
-        result.rows.length ===
-        0
-      ) {
-        return res.status(404).json({
-          error:
-            "Issue not found."
-        });
-      }
-
-      return res.json(
-        result.rows[0]
-      );
-    } catch (error) {
-      console.error(
-        "Issue update error:",
-        error
-      );
-
-      return res.status(500).json({
-        error:
-          "Issue update failed."
+    if (!Number.isInteger(issueId) || issueId <= 0) {
+      return res.status(400).json({
+        error: "Invalid issue ID."
       });
     }
+
+    if (!["open", "closed"].includes(status)) {
+      return res.status(400).json({
+        error: "Status must be open or closed."
+      });
+    }
+
+    const issueResult = await pool.query(
+      `
+      SELECT
+        i.*,
+        r.owner_id
+      FROM issues i
+      JOIN repositories r ON r.id = i.repo_id
+      WHERE i.id = $1
+      `,
+      [issueId]
+    );
+
+    if (!issueResult.rows.length) {
+      return res.status(404).json({
+        error: "Issue not found."
+      });
+    }
+
+    const issue = issueResult.rows[0];
+
+    const allowed =
+      Number(issue.author_id) === Number(req.user.id) ||
+      Number(issue.owner_id) === Number(req.user.id);
+
+    if (!allowed) {
+      return res.status(403).json({
+        error: "You cannot change this issue."
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE issues
+      SET
+        status = $1,
+        updated_at = NOW()
+      WHERE id = $2
+      RETURNING *
+      `,
+      [status, issueId]
+    );
+
+    res.json({
+      ok: true,
+      issue: result.rows[0]
+    });
+  } catch (error) {
+    console.error("UPDATE ISSUE ERROR:", error);
+
+    res.status(500).json({
+      error: "Unable to update issue."
+    });
   }
-);
+});
 
 /* =========================================================
    SEARCH
 ========================================================= */
 
-app.get(
-  "/api/search",
-  requireDatabase,
-  async (req, res) => {
-    try {
-      const q =
-        String(
-          req.query.q || ""
-        ).trim();
+app.get("/api/search", async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
 
-      if (!q) {
-        return res.json({
-          users: [],
-          repositories: []
-        });
-      }
-
-      const users =
-        await pool.query(
-          `
-          SELECT
-            id,
-            username,
-            bio,
-            avatar
-          FROM users
-          WHERE username ILIKE $1
-          ORDER BY username
-          LIMIT 20
-          `,
-          ["%" + q + "%"]
-        );
-
-      const repositories =
-        await pool.query(
-          `
-          SELECT
-            r.id,
-            r.name,
-            r.description,
-            r.stars,
-            u.username AS owner
-          FROM repositories r
-          JOIN users u
-            ON u.id = r.owner_id
-          WHERE
-            r.visibility = 'public'
-            AND (
-              r.name ILIKE $1
-              OR r.description ILIKE $1
-            )
-          ORDER BY r.stars DESC
-          LIMIT 30
-          `,
-          ["%" + q + "%"]
-        );
-
+    if (!q) {
       return res.json({
-        users:
-          users.rows,
-        repositories:
-          repositories.rows
-      });
-    } catch (error) {
-      console.error(
-        "Search error:",
-        error
-      );
-
-      return res.status(500).json({
-        error:
-          "Search failed."
+        users: [],
+        repositories: []
       });
     }
+
+    const search = "%" + q + "%";
+
+    const users = await pool.query(
+      `
+      SELECT
+        id,
+        username,
+        full_name,
+        bio,
+        avatar,
+        created_at
+      FROM users
+      WHERE
+        username ILIKE $1
+        OR full_name ILIKE $1
+      ORDER BY username
+      LIMIT 20
+      `,
+      [search]
+    );
+
+    const repositories = await pool.query(
+      `
+      SELECT
+        r.id,
+        r.name,
+        r.description,
+        r.visibility,
+        r.stars,
+        r.created_at,
+        r.owner_id,
+        u.username AS owner_username
+      FROM repositories r
+      JOIN users u ON u.id = r.owner_id
+      WHERE
+        r.visibility = 'public'
+        AND (
+          r.name ILIKE $1
+          OR r.description ILIKE $1
+        )
+      ORDER BY r.stars DESC, r.created_at DESC
+      LIMIT 50
+      `,
+      [search]
+    );
+
+    res.json({
+      users: users.rows.map(publicUser),
+      repositories: repositories.rows.map(publicRepo)
+    });
+  } catch (error) {
+    console.error("SEARCH ERROR:", error);
+
+    res.status(500).json({
+      error: "Search failed."
+    });
   }
-);
+});
 
 /* =========================================================
    FRONTEND
@@ -1541,1792 +1396,1018 @@ const html = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta
-  name="viewport"
-  content="width=device-width,initial-scale=1"
->
-<title>NOVAIX</title>
+  <meta charset="UTF-8">
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  >
+  <title>NOVAIX</title>
 
-<style>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
 
-*{
-  box-sizing:border-box;
-}
+    :root {
+      --bg: #080b12;
+      --panel: #101522;
+      --panel2: #151b2b;
+      --border: #273044;
+      --text: #f5f7fb;
+      --muted: #929bb0;
+      --accent: #7c5cff;
+      --accent2: #5eead4;
+      --danger: #ef4444;
+      --success: #22c55e;
+    }
 
-html,
-body{
-  margin:0;
-  min-height:100%;
-  background:#050506;
-  color:#f6f6f7;
-  font-family:
-    Inter,
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
-}
+    body {
+      margin: 0;
+      background:
+        radial-gradient(
+          circle at top left,
+          rgba(124, 92, 255, .16),
+          transparent 30%
+        ),
+        var(--bg);
+      color: var(--text);
+      font-family:
+        Inter,
+        ui-sans-serif,
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+      min-height: 100vh;
+    }
 
-body{
-  overflow-x:hidden;
-}
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
 
-a{
-  color:inherit;
-  text-decoration:none;
-}
+    button,
+    input,
+    textarea,
+    select {
+      font: inherit;
+    }
 
-button,
-input,
-textarea{
-  font:inherit;
-}
+    button {
+      cursor: pointer;
+    }
 
-button{
-  cursor:pointer;
-}
+    .nav {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 16px 6%;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      background: rgba(8,11,18,.88);
+      backdrop-filter: blur(16px);
+    }
 
-.nav{
-  height:76px;
-  border-bottom:1px solid #1d1d24;
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  padding:0 7%;
-  background:rgba(5,5,6,.86);
-  backdrop-filter:blur(20px);
-  position:sticky;
-  top:0;
-  z-index:20;
-}
+    .brand {
+      font-size: 21px;
+      font-weight: 900;
+      letter-spacing: -.5px;
+    }
 
-.logo{
-  display:flex;
-  align-items:center;
-  gap:12px;
-  font-weight:900;
-  font-size:21px;
-}
+    .brand span {
+      color: var(--accent);
+    }
 
-.logoIcon{
-  width:38px;
-  height:38px;
-  border-radius:12px;
-  display:grid;
-  place-items:center;
-  background:
-    linear-gradient(
-      135deg,
-      #fff,
-      #a99cff
-    );
-  color:#111;
-  font-weight:900;
-  box-shadow:
-    0 0 30px
-    rgba(154,136,255,.25);
-}
+    .nav-links {
+      display: flex;
+      gap: 18px;
+      align-items: center;
+      color: var(--muted);
+    }
 
-.navLinks{
-  display:flex;
-  align-items:center;
-  gap:28px;
-  color:#a9a9b4;
-}
+    .nav-links a:hover {
+      color: var(--text);
+    }
 
-.navLinks a:hover{
-  color:white;
-}
+    .container {
+      width: min(1100px, 92%);
+      margin: 0 auto;
+      padding: 50px 0 80px;
+    }
 
-.btn{
-  border:0;
-  border-radius:13px;
-  padding:13px 20px;
-  font-weight:800;
-}
+    .hero {
+      min-height: 70vh;
+      display: grid;
+      place-items: center;
+      text-align: center;
+    }
 
-.btnPrimary{
-  background:
-    linear-gradient(
-      135deg,
-      #fff,
-      #b5a7ff
-    );
-  color:#111;
-}
+    .hero h1 {
+      margin: 0;
+      font-size: clamp(48px, 10vw, 92px);
+      line-height: .95;
+      letter-spacing: -5px;
+    }
 
-.btnDark{
-  background:#111116;
-  border:1px solid #292932;
-  color:white;
-}
+    .gradient {
+      background: linear-gradient(
+        90deg,
+        #ffffff,
+        #a78bfa,
+        #5eead4
+      );
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
 
-.hero{
-  max-width:1200px;
-  margin:0 auto;
-  padding:100px 24px;
-  text-align:center;
-}
+    .hero p {
+      max-width: 650px;
+      margin: 24px auto;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1.7;
+    }
 
-.badge{
-  display:inline-flex;
-  padding:8px 13px;
-  border:1px solid #292938;
-  background:#101017;
-  border-radius:999px;
-  color:#bdb7ff;
-  font-size:13px;
-  font-weight:700;
-}
+    .actions {
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
 
-.hero h1{
-  font-size:
-    clamp(52px,8vw,100px);
-  line-height:.95;
-  letter-spacing:-5px;
-  margin:28px 0;
-}
+    .btn {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 18px;
+      background: var(--panel2);
+      color: var(--text);
+      transition: .2s;
+    }
 
-.gradient{
-  background:
-    linear-gradient(
-      135deg,
-      #fff,
-      #b8adff,
-      #7e72ff
-    );
-  -webkit-background-clip:text;
-  background-clip:text;
-  color:transparent;
-}
+    .btn:hover {
+      transform: translateY(-1px);
+      border-color: var(--accent);
+    }
 
-.hero p{
-  max-width:720px;
-  margin:0 auto;
-  color:#92929d;
-  font-size:19px;
-  line-height:1.7;
-}
+    .btn.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: white;
+    }
 
-.actions{
-  display:flex;
-  justify-content:center;
-  gap:12px;
-  margin-top:32px;
-}
+    .card {
+      background: rgba(16,21,34,.88);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 26px;
+      box-shadow: 0 20px 80px rgba(0,0,0,.2);
+    }
 
-.container{
-  width:min(1180px,92%);
-  margin:auto;
-}
+    .form-card {
+      width: min(500px, 100%);
+      margin: 30px auto;
+    }
 
-.panel{
-  background:
-    linear-gradient(
-      180deg,
-      #101016,
-      #09090c
-    );
-  border:1px solid #24242d;
-  border-radius:22px;
-  padding:24px;
-  box-shadow:
-    0 30px 80px
-    rgba(0,0,0,.35);
-}
+    .form-card h1 {
+      margin-top: 0;
+    }
 
-.grid{
-  display:grid;
-  grid-template-columns:
-    repeat(
-      auto-fit,
-      minmax(260px,1fr)
-    );
-  gap:18px;
-}
+    .muted {
+      color: var(--muted);
+    }
 
-.card{
-  background:#0d0d12;
-  border:1px solid #22222b;
-  border-radius:18px;
-  padding:22px;
-}
+    label {
+      display: block;
+      margin: 16px 0 8px;
+      color: #dbe1ee;
+      font-size: 14px;
+    }
 
-.card h3{
-  margin-top:0;
-}
+    input,
+    textarea,
+    select {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      outline: none;
+      background: #0b101b;
+      color: var(--text);
+      padding: 12px 14px;
+    }
 
-.muted{
-  color:#8d8d99;
-}
+    textarea {
+      min-height: 130px;
+      resize: vertical;
+    }
 
-.input{
-  width:100%;
-  padding:15px 16px;
-  border-radius:13px;
-  border:1px solid #292933;
-  background:#08080b;
-  color:white;
-  outline:none;
-  margin:7px 0 16px;
-}
+    input:focus,
+    textarea:focus,
+    select:focus {
+      border-color: var(--accent);
+    }
 
-.input:focus{
-  border-color:#9d91ff;
-  box-shadow:
-    0 0 0 3px
-    rgba(157,145,255,.12);
-}
+    .error {
+      margin: 15px 0;
+      padding: 12px;
+      border-radius: 10px;
+      background: rgba(239,68,68,.12);
+      border: 1px solid rgba(239,68,68,.3);
+      color: #fca5a5;
+    }
 
-label{
-  font-size:12px;
-  font-weight:800;
-  color:#a9a9b5;
-  text-transform:uppercase;
-}
+    .success {
+      margin: 15px 0;
+      padding: 12px;
+      border-radius: 10px;
+      background: rgba(34,197,94,.12);
+      border: 1px solid rgba(34,197,94,.3);
+      color: #86efac;
+    }
 
-.form{
-  width:min(460px,100%);
-  margin:60px auto;
-}
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
 
-.alert{
-  padding:13px 15px;
-  border-radius:12px;
-  margin-bottom:18px;
-  background:#281518;
-  border:1px solid #603035;
-  color:#ffb4bc;
-}
+    .repo {
+      display: block;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 20px;
+    }
 
-.success{
-  background:#122117;
-  border-color:#285b39;
-  color:#a5efb8;
-}
+    .repo:hover {
+      border-color: var(--accent);
+    }
 
-.repo{
-  transition:.2s;
-}
+    .repo-title {
+      font-weight: 800;
+      font-size: 19px;
+    }
 
-.repo:hover{
-  transform:translateY(-3px);
-  border-color:#514b78;
-}
+    .badge {
+      display: inline-block;
+      margin-left: 8px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: #20283b;
+      color: var(--muted);
+      font-size: 11px;
+    }
 
-.repoName{
-  font-size:19px;
-  font-weight:850;
-  color:#b9adff;
-}
+    .meta {
+      display: flex;
+      gap: 15px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 14px;
+    }
 
-.stats{
-  display:flex;
-  gap:20px;
-  margin-top:15px;
-  color:#888894;
-  font-size:13px;
-}
+    .section-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 15px;
+      margin-bottom: 20px;
+    }
 
-.code{
-  background:#07070a;
-  border:1px solid #24242c;
-  border-radius:15px;
-  padding:20px;
-  overflow:auto;
-  color:#d6d2ff;
-  white-space:pre-wrap;
-  font-family:
-    ui-monospace,
-    SFMono-Regular,
-    Consolas,
-    monospace;
-}
+    .file {
+      padding: 13px 15px;
+      border-bottom: 1px solid var(--border);
+      font-family: monospace;
+      color: #c4b5fd;
+    }
 
-.footer{
-  border-top:1px solid #1b1b21;
-  margin-top:100px;
-  padding:30px 7%;
-  color:#666672;
-  display:flex;
-  justify-content:space-between;
-}
+    .issue {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 15px;
+      margin-top: 10px;
+    }
 
-.hidden{
-  display:none!important;
-}
+    footer {
+      text-align: center;
+      color: var(--muted);
+      padding: 30px;
+      border-top: 1px solid rgba(255,255,255,.06);
+    }
 
-@media(max-width:700px){
+    @media (max-width: 700px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
 
-  .nav{
-    padding:0 20px;
-  }
+      .nav-links {
+        gap: 10px;
+        font-size: 13px;
+      }
 
-  .navLinks a:not(.btn){
-    display:none;
-  }
-
-  .hero{
-    padding:70px 20px;
-  }
-
-  .hero h1{
-    letter-spacing:-3px;
-  }
-
-  .actions{
-    flex-direction:column;
-  }
-
-  .footer{
-    flex-direction:column;
-    gap:10px;
-  }
-
-}
-
-</style>
+      .hero h1 {
+        letter-spacing: -3px;
+      }
+    }
+  </style>
 </head>
 
 <body>
 
-<header class="nav">
+  <nav class="nav">
+    <a class="brand" href="/">N<span>OVAIX</span></a>
 
-<a href="/" class="logo">
-  <span class="logoIcon">N</span>
-  NOVAIX
-</a>
+    <div class="nav-links">
+      <a href="/">Home</a>
+      <a href="/repos">Repositories</a>
+      <a href="/login" id="navLogin">Login</a>
+      <a href="/register" id="navRegister">Get Started</a>
+      <a href="/dashboard" id="navDashboard" style="display:none">Dashboard</a>
+      <a href="#" id="navLogout" style="display:none">Logout</a>
+    </div>
+  </nav>
 
-<nav class="navLinks">
-  <a href="/">Home</a>
-  <a href="/repositories">Repositories</a>
-  <a href="/login" id="loginLink">Login</a>
-  <a
-    href="/register"
-    class="btn btnPrimary"
-    id="startLink"
-  >
-    Get Started
-  </a>
-</nav>
+  <main id="app"></main>
 
-</header>
-
-<main id="app"></main>
-
-<footer class="footer">
-  <span>© ${new Date().getFullYear()} NOVAIX</span>
-  <span>Built for the next generation.</span>
-</footer>
+  <footer>
+    © ${new Date().getFullYear()} NOVAIX · Built for the next generation.
+  </footer>
 
 <script>
+(function () {
+  "use strict";
 
-const API = "/api";
+  var app = document.getElementById("app");
 
-/* =========================================================
-   FRONTEND HELPERS
-========================================================= */
-
-function token(){
-  return localStorage.getItem(
-    "novaix_token"
-  );
-}
-
-function user(){
-  try{
-    return JSON.parse(
-      localStorage.getItem(
-        "novaix_user"
-      )
-    );
-  }catch(error){
-    return null;
-  }
-}
-
-function headers(){
-
-  const h = {
-    "Content-Type":
-      "application/json"
-  };
-
-  if(token()){
-    h.Authorization =
-      "Bearer " + token();
+  function escapeHtml(value) {
+    return String(value == null ? "" : value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
   }
 
-  return h;
-}
-
-async function api(
-  url,
-  options
-){
-
-  options =
-    options || {};
-
-  const response =
-    await fetch(
-      API + url,
-      {
-        ...options,
-        headers:{
-          ...headers(),
-          ...(options.headers || {})
-        }
-      }
-    );
-
-  const data =
-    await response
-      .json()
-      .catch(function(){
-        return {};
-      });
-
-  if(!response.ok){
-    throw new Error(
-      data.error ||
-      "Request failed"
-    );
+  function getToken() {
+    return localStorage.getItem("novaix_token") || "";
   }
 
-  return data;
-}
-
-function escapeHtml(value){
-
-  return String(
-    value == null
-      ? ""
-      : value
-  )
-    .replaceAll(
-      "&",
-      "&amp;"
-    )
-    .replaceAll(
-      "<",
-      "&lt;"
-    )
-    .replaceAll(
-      ">",
-      "&gt;"
-    )
-    .replaceAll(
-      '"',
-      "&quot;"
-    )
-    .replaceAll(
-      "'",
-      "&#039;"
-    );
-}
-
-function layout(content){
-
-  document.getElementById(
-    "app"
-  ).innerHTML = content;
-
-  updateNavigation();
-}
-
-function updateNavigation(){
-
-  const logged =
-    !!token();
-
-  const login =
-    document.getElementById(
-      "loginLink"
-    );
-
-  const start =
-    document.getElementById(
-      "startLink"
-    );
-
-  if(login){
-
-    login.textContent =
-      logged
-        ? "Dashboard"
-        : "Login";
-
-    login.href =
-      logged
-        ? "/dashboard"
-        : "/login";
-  }
-
-  if(start){
-
-    if(logged){
-      start.textContent =
-        "Dashboard";
-      start.href =
-        "/dashboard";
-    }else{
-      start.textContent =
-        "Get Started";
-      start.href =
-        "/register";
-    }
-  }
-}
-
-/* =========================================================
-   HOME
-========================================================= */
-
-function home(){
-
-  layout(
-    '<section class="hero">' +
-
-      '<div class="badge">' +
-        'Developer platform for the next generation' +
-      '</div>' +
-
-      '<h1>' +
-        'Build. ' +
-        '<span class="gradient">Ship.</span> ' +
-        'Scale.' +
-      '</h1>' +
-
-      '<p>' +
-        'NOVAIX is a modern developer platform for repositories, ' +
-        'collaboration, issues, commits and open source projects.' +
-      '</p>' +
-
-      '<div class="actions">' +
-
-        '<a ' +
-          'class="btn btnPrimary" ' +
-          'href="/register">' +
-          'Create your account →' +
-        '</a>' +
-
-        '<a ' +
-          'class="btn btnDark" ' +
-          'href="/repositories">' +
-          'Explore repositories' +
-        '</a>' +
-
-      '</div>' +
-
-    '</section>' +
-
-    '<section class="container">' +
-
-      '<div class="grid">' +
-
-        '<div class="card">' +
-          '<h3>Repositories</h3>' +
-          '<p class="muted">' +
-            'Create and manage your projects with a clean developer workflow.' +
-          '</p>' +
-        '</div>' +
-
-        '<div class="card">' +
-          '<h3>Collaboration</h3>' +
-          '<p class="muted">' +
-            'Stars, issues, profiles and commits in one place.' +
-          '</p>' +
-        '</div>' +
-
-        '<div class="card">' +
-          '<h3>Built for scale</h3>' +
-          '<p class="muted">' +
-            'PostgreSQL-backed architecture ready for Render deployment.' +
-          '</p>' +
-        '</div>' +
-
-      '</div>' +
-
-    '</section>'
-  );
-}
-
-/* =========================================================
-   LOGIN
-========================================================= */
-
-function loginPage(){
-
-  layout(
-    '<section class="container">' +
-
-      '<div class="panel form">' +
-
-        '<div class="logo">' +
-          '<span class="logoIcon">N</span>' +
-          'NOVAIX' +
-        '</div>' +
-
-        '<h1>Welcome back</h1>' +
-
-        '<p class="muted">' +
-          'Sign in to continue to NOVAIX.' +
-        '</p>' +
-
-        '<div id="error"></div>' +
-
-        '<form id="loginForm">' +
-
-          '<label>Email</label>' +
-
-          '<input ' +
-            'class="input" ' +
-            'id="email" ' +
-            'type="email" ' +
-            'required ' +
-            'placeholder="you@example.com">' +
-
-          '<label>Password</label>' +
-
-          '<input ' +
-            'class="input" ' +
-            'id="password" ' +
-            'type="password" ' +
-            'required ' +
-            'placeholder="••••••••">' +
-
-          '<button ' +
-            'class="btn btnPrimary" ' +
-            'style="width:100%">' +
-            'Sign In →' +
-          '</button>' +
-
-        '</form>' +
-
-        '<p class="muted">' +
-          "Don't have an account? " +
-          '<a ' +
-            'href="/register" ' +
-            'style="color:#b9adff">' +
-            'Create one' +
-          '</a>' +
-        '</p>' +
-
-      '</div>' +
-
-    '</section>'
-  );
-
-  const form =
-    document.getElementById(
-      "loginForm"
-    );
-
-  if(!form) return;
-
-  form.addEventListener(
-    "submit",
-    async function(e){
-
-      e.preventDefault();
-
-      const error =
-        document.getElementById(
-          "error"
-        );
-
-      try{
-
-        const data =
-          await api(
-            "/login",
-            {
-              method:"POST",
-              body:JSON.stringify({
-                email:
-                  document.getElementById(
-                    "email"
-                  ).value,
-                password:
-                  document.getElementById(
-                    "password"
-                  ).value
-              })
-            }
-          );
-
-        localStorage.setItem(
-          "novaix_token",
-          data.token
-        );
-
-        localStorage.setItem(
-          "novaix_user",
-          JSON.stringify(
-            data.user
-          )
-        );
-
-        location.href =
-          "/dashboard";
-
-      }catch(err){
-
-        error.innerHTML =
-          '<div class="alert">' +
-          escapeHtml(
-            err.message
-          ) +
-          '</div>';
-      }
-    }
-  );
-}
-
-/* =========================================================
-   REGISTER
-========================================================= */
-
-function registerPage(){
-
-  layout(
-    '<section class="container">' +
-
-      '<div class="panel form">' +
-
-        '<div class="logo">' +
-          '<span class="logoIcon">N</span>' +
-          'NOVAIX' +
-        '</div>' +
-
-        '<h1>Create account</h1>' +
-
-        '<p class="muted">' +
-          'Start building with NOVAIX.' +
-        '</p>' +
-
-        '<div id="error"></div>' +
-
-        '<form id="registerForm">' +
-
-          '<label>Username</label>' +
-
-          '<input ' +
-            'class="input" ' +
-            'id="username" ' +
-            'required ' +
-            'placeholder="yourname">' +
-
-          '<label>Email</label>' +
-
-          '<input ' +
-            'class="input" ' +
-            'id="email" ' +
-            'type="email" ' +
-            'required ' +
-            'placeholder="you@example.com">' +
-
-          '<label>Password</label>' +
-
-          '<input ' +
-            'class="input" ' +
-            'id="password" ' +
-            'type="password" ' +
-            'minlength="6" ' +
-            'required ' +
-            'placeholder="At least 6 characters">' +
-
-          '<button ' +
-            'class="btn btnPrimary" ' +
-            'style="width:100%">' +
-            'Create Account →' +
-          '</button>' +
-
-        '</form>' +
-
-        '<p class="muted">' +
-          'Already have an account? ' +
-          '<a ' +
-            'href="/login" ' +
-            'style="color:#b9adff">' +
-            'Sign in' +
-          '</a>' +
-        '</p>' +
-
-      '</div>' +
-
-    '</section>'
-  );
-
-  const form =
-    document.getElementById(
-      "registerForm"
-    );
-
-  if(!form) return;
-
-  form.addEventListener(
-    "submit",
-    async function(e){
-
-      e.preventDefault();
-
-      const error =
-        document.getElementById(
-          "error"
-        );
-
-      try{
-
-        const data =
-          await api(
-            "/register",
-            {
-              method:"POST",
-              body:JSON.stringify({
-                username:
-                  document.getElementById(
-                    "username"
-                  ).value,
-                email:
-                  document.getElementById(
-                    "email"
-                  ).value,
-                password:
-                  document.getElementById(
-                    "password"
-                  ).value
-              })
-            }
-          );
-
-        localStorage.setItem(
-          "novaix_token",
-          data.token
-        );
-
-        localStorage.setItem(
-          "novaix_user",
-          JSON.stringify(
-            data.user
-          )
-        );
-
-        location.href =
-          "/dashboard";
-
-      }catch(err){
-
-        error.innerHTML =
-          '<div class="alert">' +
-          escapeHtml(
-            err.message
-          ) +
-          '</div>';
-      }
-    }
-  );
-}
-
-/* =========================================================
-   DASHBOARD
-========================================================= */
-
-async function dashboard(){
-
-  if(!token()){
-    location.href =
-      "/login";
-    return;
-  }
-
-  const u = user();
-
-  let repos = [];
-
-  try{
-
-    const all =
-      await api(
-        "/repos"
+  function getUser() {
+    try {
+      return JSON.parse(
+        localStorage.getItem("novaix_user") || "null"
       );
-
-    repos =
-      all.filter(
-        function(r){
-          return (
-            u &&
-            r.owner ===
-              u.username
-          );
-        }
-      );
-
-  }catch(error){
-    console.error(error);
+    } catch (e) {
+      return null;
+    }
   }
 
-  let repoHtml = "";
+  function saveAuth(data) {
+    localStorage.setItem("novaix_token", data.token);
+    localStorage.setItem(
+      "novaix_user",
+      JSON.stringify(data.user)
+    );
+    updateNav();
+  }
 
-  if(repos.length){
+  function clearAuth() {
+    localStorage.removeItem("novaix_token");
+    localStorage.removeItem("novaix_user");
+    updateNav();
+  }
 
-    repoHtml =
-      repos.map(
-        function(repo){
+  function updateNav() {
+    var logged = !!getToken();
 
-          return (
-            '<a ' +
-              'class="card repo" ' +
-              'href="/repo/' +
-              encodeURIComponent(
-                repo.owner
-              ) +
-              '/' +
-              encodeURIComponent(
-                repo.name
-              ) +
-              '">' +
+    document.getElementById("navLogin").style.display =
+      logged ? "none" : "inline";
 
-              '<div class="repoName">' +
-                escapeHtml(
-                  repo.name
-                ) +
-              '</div>' +
+    document.getElementById("navRegister").style.display =
+      logged ? "none" : "inline";
 
-              '<p class="muted">' +
-                escapeHtml(
-                  repo.description ||
-                  "No description"
-                ) +
-              '</p>' +
+    document.getElementById("navDashboard").style.display =
+      logged ? "inline" : "none";
 
-              '<div class="stats">' +
-                '<span>★ ' +
-                  repo.stars +
-                '</span>' +
-                '<span>' +
-                  escapeHtml(
-                    repo.visibility
-                  ) +
-                '</span>' +
-              '</div>' +
+    document.getElementById("navLogout").style.display =
+      logged ? "inline" : "none";
+  }
 
-            '</a>'
-          );
-        }
-      ).join("");
+  async function api(url, options) {
+    options = options || {};
+    options.headers = options.headers || {};
 
-  }else{
+    if (!options.headers["Content-Type"] && options.body) {
+      options.headers["Content-Type"] = "application/json";
+    }
 
-    repoHtml =
-      '<div class="card">' +
-        '<h3>No repositories yet</h3>' +
-        '<p class="muted">' +
-          'Create your first repository.' +
-        '</p>' +
+    var token = getToken();
+
+    if (token) {
+      options.headers.Authorization = "Bearer " + token;
+    }
+
+    var response;
+
+    try {
+      response = await fetch(url, options);
+    } catch (error) {
+      throw new Error(
+        "Serverga ulanishda xatolik. Internet yoki Render serverini tekshiring."
+      );
+    }
+
+    var text = await response.text();
+    var data;
+
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch (error) {
+      throw new Error(
+        "Server JSON javob qaytarmadi. HTTP " + response.status
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        data.error || ("Server xatosi: HTTP " + response.status)
+      );
+    }
+
+    return data;
+  }
+
+  function layout(title, content) {
+    return (
+      '<div class="container">' +
+        '<div class="section-title">' +
+          '<div>' +
+            '<h1>' + escapeHtml(title) + '</h1>' +
+          '</div>' +
+        '</div>' +
+        content +
+      '</div>'
+    );
+  }
+
+  function showError(message) {
+    return '<div class="error">' + escapeHtml(message) + '</div>';
+  }
+
+  function home() {
+    app.innerHTML =
+      '<div class="container hero">' +
+        '<div>' +
+          '<h1>Build with <span class="gradient">NOVAIX</span></h1>' +
+          '<p>' +
+            'A modern developer platform for repositories, code, issues and collaboration.' +
+          '</p>' +
+          '<div class="actions">' +
+            '<a class="btn primary" href="/register">Get Started</a>' +
+            '<a class="btn" href="/repos">Explore Repositories</a>' +
+          '</div>' +
+        '</div>' +
       '</div>';
   }
 
-  layout(
-    '<section ' +
-      'class="container" ' +
-      'style="padding:60px 0">' +
+  function loginPage() {
+    app.innerHTML = layout(
+      "Welcome back",
+      '<div class="card form-card">' +
+        '<p class="muted">Sign in to your NOVAIX account.</p>' +
+        '<div id="loginError"></div>' +
 
-      '<div class="panel">' +
+        '<form id="loginForm">' +
+          '<label>USERNAME OR EMAIL</label>' +
+          '<input id="login" required autocomplete="username">' +
 
-        '<h1>Welcome, ' +
-          escapeHtml(
-            u &&
-            u.username
-              ? u.username
-              : "Developer"
-          ) +
-        '</h1>' +
+          '<label>PASSWORD</label>' +
+          '<input id="password" type="password" required autocomplete="current-password">' +
+
+          '<br><br>' +
+          '<button class="btn primary" type="submit">Sign In →</button>' +
+        '</form>' +
 
         '<p class="muted">' +
-          'Your NOVAIX developer workspace.' +
+          'No account? <a href="/register">Create one</a>' +
+        '</p>' +
+      '</div>'
+    );
+
+    document
+      .getElementById("loginForm")
+      .addEventListener("submit", async function (event) {
+        event.preventDefault();
+
+        var errorBox = document.getElementById("loginError");
+        errorBox.innerHTML = "";
+
+        try {
+          var data = await api("/api/login", {
+            method: "POST",
+            body: JSON.stringify({
+              login: document.getElementById("login").value,
+              password: document.getElementById("password").value
+            })
+          });
+
+          saveAuth(data);
+          location.href = "/dashboard";
+        } catch (error) {
+          errorBox.innerHTML = showError(error.message);
+        }
+      });
+  }
+
+  function registerPage() {
+    app.innerHTML = layout(
+      "Create your account",
+      '<div class="card form-card">' +
+        '<p class="muted">Start your NOVAIX experience.</p>' +
+        '<div id="registerError"></div>' +
+
+        '<form id="registerForm">' +
+          '<label>FULL NAME</label>' +
+          '<input id="fullName" required autocomplete="name">' +
+
+          '<label>USERNAME</label>' +
+          '<input id="username" required autocomplete="username">' +
+
+          '<label>EMAIL</label>' +
+          '<input id="email" type="email" required autocomplete="email">' +
+
+          '<label>PASSWORD</label>' +
+          '<input id="password" type="password" minlength="6" required autocomplete="new-password">' +
+
+          '<br><br>' +
+          '<button class="btn primary" type="submit">Create Account →</button>' +
+        '</form>' +
+
+        '<p class="muted">' +
+          'Already have an account? <a href="/login">Sign in</a>' +
+        '</p>' +
+      '</div>'
+    );
+
+    document
+      .getElementById("registerForm")
+      .addEventListener("submit", async function (event) {
+        event.preventDefault();
+
+        var errorBox = document.getElementById("registerError");
+        errorBox.innerHTML = "";
+
+        var button = event.target.querySelector("button");
+        button.disabled = true;
+        button.textContent = "Creating...";
+
+        try {
+          var data = await api("/api/register", {
+            method: "POST",
+            body: JSON.stringify({
+              fullName: document.getElementById("fullName").value,
+              username: document.getElementById("username").value,
+              email: document.getElementById("email").value,
+              password: document.getElementById("password").value
+            })
+          });
+
+          saveAuth(data);
+          location.href = "/dashboard";
+        } catch (error) {
+          errorBox.innerHTML = showError(error.message);
+          button.disabled = false;
+          button.textContent = "Create Account →";
+        }
+      });
+  }
+
+  async function dashboard() {
+    if (!getToken()) {
+      location.href = "/login";
+      return;
+    }
+
+    app.innerHTML = layout(
+      "Dashboard",
+      '<div id="dashboardContent"><p class="muted">Loading...</p></div>'
+    );
+
+    try {
+      var me = await api("/api/me");
+      var data = await api("/api/repos");
+
+      var user = me.user;
+      var repos = data.repositories.filter(function (repo) {
+        return Number(repo.owner.id) === Number(user.id);
+      });
+
+      var content =
+        '<div class="card">' +
+          '<h2>Welcome, ' +
+            escapeHtml(user.full_name || user.username) +
+          '</h2>' +
+          '<p class="muted">@' +
+            escapeHtml(user.username) +
+          '</p>' +
+          '<button class="btn primary" id="createRepoBtn">+ Create Repository</button>' +
+        '</div>' +
+
+        '<br>' +
+
+        '<div class="section-title">' +
+          '<h2>Your repositories</h2>' +
+        '</div>';
+
+      if (!repos.length) {
+        content +=
+          '<div class="card">' +
+            '<p class="muted">You have no repositories yet.</p>' +
+          '</div>';
+      } else {
+        content += '<div class="grid">';
+
+        repos.forEach(function (repo) {
+          content += repoCard(repo);
+        });
+
+        content += '</div>';
+      }
+
+      document.getElementById("dashboardContent").innerHTML = content;
+
+      document
+        .getElementById("createRepoBtn")
+        .addEventListener("click", createRepo);
+    } catch (error) {
+      document.getElementById("dashboardContent").innerHTML =
+        showError(error.message);
+    }
+  }
+
+  function repoCard(repo) {
+    return (
+      '<a class="repo" href="/repo/' +
+        encodeURIComponent(repo.owner.username) +
+        '/' +
+        encodeURIComponent(repo.name) +
+      '">' +
+
+        '<div class="repo-title">' +
+          escapeHtml(repo.name) +
+          '<span class="badge">' +
+            escapeHtml(repo.visibility) +
+          '</span>' +
+        '</div>' +
+
+        '<p class="muted">' +
+          escapeHtml(repo.description || "No description") +
         '</p>' +
 
-        '<div ' +
-          'class="actions" ' +
-          'style="justify-content:flex-start">' +
-
-          '<button ' +
-            'class="btn btnPrimary" ' +
-            'onclick="createRepo()">' +
-            '+ New Repository' +
-          '</button>' +
-
-          '<button ' +
-            'class="btn btnDark" ' +
-            'onclick="logout()">' +
-            'Logout' +
-          '</button>' +
-
+        '<div class="meta">' +
+          '<span>★ ' + Number(repo.stars || 0) + '</span>' +
+          '<span>@' + escapeHtml(repo.owner.username) + '</span>' +
         '</div>' +
 
-      '</div>' +
-
-      '<h2 style="margin-top:45px">' +
-        'Your repositories' +
-      '</h2>' +
-
-      '<div class="grid">' +
-        repoHtml +
-      '</div>' +
-
-    '</section>'
-  );
-}
-
-/* =========================================================
-   CREATE REPOSITORY
-========================================================= */
-
-async function createRepo(){
-
-  const name =
-    prompt(
-      "Repository name:"
-    );
-
-  if(!name) return;
-
-  const description =
-    prompt(
-      "Description:"
-    ) || "";
-
-  try{
-
-    await api(
-      "/repos",
-      {
-        method:"POST",
-        body:JSON.stringify({
-          name:name,
-          description:
-            description,
-          visibility:
-            "public"
-        })
-      }
-    );
-
-    alert(
-      "Repository created!"
-    );
-
-    await dashboard();
-
-  }catch(error){
-
-    alert(
-      error.message
+      '</a>'
     );
   }
-}
 
-/* =========================================================
-   REPOSITORIES
-========================================================= */
+  async function createRepo() {
+    var name = prompt("Repository name:");
 
-async function repositories(){
-
-  try{
-
-    const repos =
-      await api(
-        "/repos"
-      );
-
-    let repoHtml = "";
-
-    if(repos.length){
-
-      repoHtml =
-        repos.map(
-          function(repo){
-
-            return (
-              '<a ' +
-                'class="card repo" ' +
-                'href="/repo/' +
-                encodeURIComponent(
-                  repo.owner
-                ) +
-                '/' +
-                encodeURIComponent(
-                  repo.name
-                ) +
-                '">' +
-
-                '<div class="repoName">' +
-                  escapeHtml(
-                    repo.owner
-                  ) +
-                  '/' +
-                  escapeHtml(
-                    repo.name
-                  ) +
-                '</div>' +
-
-                '<p class="muted">' +
-                  escapeHtml(
-                    repo.description ||
-                    "No description"
-                  ) +
-                '</p>' +
-
-                '<div class="stats">' +
-                  '<span>★ ' +
-                    repo.stars +
-                  '</span>' +
-
-                  '<span>' +
-                    escapeHtml(
-                      repo.default_branch
-                    ) +
-                  '</span>' +
-                '</div>' +
-
-              '</a>'
-            );
-          }
-        ).join("");
-
-    }else{
-
-      repoHtml =
-        '<div class="card">' +
-          'No repositories found.' +
-        '</div>';
+    if (!name) {
+      return;
     }
 
-    const dashboardButton =
-      token()
-        ? (
-          '<a ' +
-            'class="btn btnPrimary" ' +
-            'href="/dashboard">' +
-            'Dashboard' +
-          '</a>'
-        )
-        : "";
+    var description = prompt("Description:") || "";
 
-    layout(
-      '<section ' +
-        'class="container" ' +
-        'style="padding:60px 0">' +
+    try {
+      var data = await api("/api/repos", {
+        method: "POST",
+        body: JSON.stringify({
+          name: name,
+          description: description,
+          visibility: "public"
+        })
+      });
 
-        '<div ' +
-          'style="' +
-            'display:flex;' +
-            'justify-content:space-between;' +
-            'align-items:center;' +
-            'gap:20px;' +
-            'flex-wrap:wrap">' +
-
-          '<div>' +
-            '<h1>Explore repositories</h1>' +
-            '<p class="muted">' +
-              'Discover public projects on NOVAIX.' +
-            '</p>' +
-          '</div>' +
-
-          dashboardButton +
-
-        '</div>' +
-
-        '<div ' +
-          'class="grid" ' +
-          'style="margin-top:30px">' +
-          repoHtml +
-        '</div>' +
-
-      '</section>'
-    );
-
-  }catch(error){
-
-    layout(
-      '<section ' +
-        'class="container" ' +
-        'style="padding:80px 0">' +
-
-        '<div class="alert">' +
-          escapeHtml(
-            error.message
-          ) +
-        '</div>' +
-
-      '</section>'
-    );
-  }
-}
-
-/* =========================================================
-   REPOSITORY PAGE
-========================================================= */
-
-async function repository(
-  username,
-  repo
-){
-
-  try{
-
-    const data =
-      await api(
-        "/repos/" +
-        encodeURIComponent(
-          username
-        ) +
+      location.href =
+        "/repo/" +
+        encodeURIComponent(getUser().username) +
         "/" +
-        encodeURIComponent(
-          repo
-        )
+        encodeURIComponent(data.repository.name);
+    } catch (error) {
+      alert(error.message);
+    }
+  }
+
+  async function repositories() {
+    app.innerHTML = layout(
+      "Repositories",
+      '<div id="repoList"><p class="muted">Loading...</p></div>'
+    );
+
+    try {
+      var data = await api("/api/repos");
+
+      if (!data.repositories.length) {
+        document.getElementById("repoList").innerHTML =
+          '<div class="card">' +
+            '<p class="muted">No repositories found.</p>' +
+          '</div>';
+        return;
+      }
+
+      var content = '<div class="grid">';
+
+      data.repositories.forEach(function (repo) {
+        content += repoCard(repo);
+      });
+
+      content += '</div>';
+
+      document.getElementById("repoList").innerHTML = content;
+    } catch (error) {
+      document.getElementById("repoList").innerHTML =
+        showError(error.message);
+    }
+  }
+
+  async function repository(username, repoName) {
+    app.innerHTML = layout(
+      "Repository",
+      '<div id="repoContent"><p class="muted">Loading...</p></div>'
+    );
+
+    try {
+      var data = await api(
+        "/api/repos/" +
+        encodeURIComponent(username) +
+        "/" +
+        encodeURIComponent(repoName)
       );
 
-    const r =
-      data.repository;
+      var repo = data.repository;
 
-    let filesHtml = "";
-
-    if(data.files.length){
-
-      filesHtml =
-        data.files.map(
-          function(file){
-
-            return (
-              '<div class="card">' +
-
-                '<h3>' +
-                  escapeHtml(
-                    file.file_path
-                  ) +
-                '</h3>' +
-
-                '<div class="code">' +
-                  escapeHtml(
-                    file.content
-                  ) +
-                '</div>' +
-
-              '</div>'
-            );
-          }
-        ).join("");
-
-    }else{
-
-      filesHtml =
+      var content =
         '<div class="card">' +
-          'No files.' +
-        '</div>';
-    }
+          '<div class="section-title">' +
+            '<div>' +
+              '<h1>' +
+                escapeHtml(repo.name) +
+              '</h1>' +
+              '<p class="muted">' +
+                escapeHtml(repo.description || "No description") +
+              '</p>' +
+            '</div>' +
 
-    let commitsHtml = "";
+            '<button class="btn" id="starBtn">' +
+              (repo.starred ? "★ Unstar" : "☆ Star") +
+              ' · ' +
+              Number(repo.stars || 0) +
+            '</button>' +
+          '</div>' +
 
-    if(data.commits.length){
+          '<div class="meta">' +
+            '<span>@' + escapeHtml(repo.owner.username) + '</span>' +
+            '<span>' + escapeHtml(repo.visibility) + '</span>' +
+          '</div>' +
+        '</div>' +
 
-      commitsHtml =
-        data.commits.map(
-          function(c){
+        '<br>' +
 
-            return (
-              '<div class="card">' +
-
-                '<b>' +
-                  escapeHtml(
-                    c.message
-                  ) +
-                '</b>' +
-
-                '<p class="muted">' +
-                  escapeHtml(
-                    c.username ||
-                    "Unknown"
-                  ) +
-                '</p>' +
-
-                '<small class="muted">' +
-                  escapeHtml(
-                    new Date(
-                      c.created_at
-                    ).toLocaleString()
-                  ) +
-                '</small>' +
-
-              '</div>'
-            );
-          }
-        ).join("");
-
-    }else{
-
-      commitsHtml =
         '<div class="card">' +
-          'No commits yet.' +
-        '</div>';
-    }
+          '<h2>Files</h2>';
 
-    let issuesHtml = "";
+      if (!data.files.length) {
+        content +=
+          '<p class="muted">No files yet.</p>';
+      } else {
+        data.files.forEach(function (file) {
+          content +=
+            '<div class="file">' +
+              escapeHtml(file.file_path) +
+            '</div>';
+        });
+      }
 
-    if(data.issues.length){
+      content +=
+        '</div>' +
 
-      issuesHtml =
-        data.issues.map(
-          function(i){
+        '<br>' +
 
-            return (
-              '<div class="card">' +
+        '<div class="card">' +
+          '<h2>Issues</h2>' +
 
-                '<h3>' +
-                  escapeHtml(
-                    i.title
-                  ) +
-                '</h3>' +
+          '<form id="issueForm">' +
+            '<label>Title</label>' +
+            '<input id="issueTitle" required>' +
 
-                '<p class="muted">' +
-                  escapeHtml(
-                    i.body || ""
-                  ) +
-                '</p>' +
+            '<label>Description</label>' +
+            '<textarea id="issueBody"></textarea>' +
 
-                '<span class="badge">' +
-                  escapeHtml(
-                    i.state
-                  ) +
+            '<br>' +
+            '<button class="btn primary" type="submit">Create Issue</button>' +
+          '</form>' +
+
+          '<div id="issues">';
+
+      if (!data.issues.length) {
+        content +=
+          '<p class="muted">No issues yet.</p>';
+      } else {
+        data.issues.forEach(function (issue) {
+          content +=
+            '<div class="issue">' +
+              '<strong>' +
+                escapeHtml(issue.title) +
+              '</strong>' +
+
+              '<p class="muted">' +
+                escapeHtml(issue.body || "") +
+              '</p>' +
+
+              '<div class="meta">' +
+                '<span>' +
+                  escapeHtml(issue.status) +
                 '</span>' +
+                '<span>@' +
+                  escapeHtml(issue.author_username) +
+                '</span>' +
+              '</div>' +
+            '</div>';
+        });
+      }
 
-              '</div>'
-            );
+      content +=
+          '</div>' +
+        '</div>';
+
+      document.getElementById("repoContent").innerHTML = content;
+
+      document
+        .getElementById("starBtn")
+        .addEventListener("click", async function () {
+          if (!getToken()) {
+            location.href = "/login";
+            return;
           }
-        ).join("");
 
-    }else{
+          try {
+            var star = await api(
+              "/api/repos/" + repo.id + "/star",
+              {
+                method: "POST"
+              }
+            );
 
-      issuesHtml =
-        '<div class="card">' +
-          'No issues yet.' +
-        '</div>';
+            document.getElementById("starBtn").textContent =
+              (star.starred ? "★ Unstar" : "☆ Star") +
+              " · " +
+              star.stars;
+          } catch (error) {
+            alert(error.message);
+          }
+        });
+
+      document
+        .getElementById("issueForm")
+        .addEventListener("submit", async function (event) {
+          event.preventDefault();
+
+          if (!getToken()) {
+            location.href = "/login";
+            return;
+          }
+
+          try {
+            await api(
+              "/api/repos/" + repo.id + "/issues",
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  title: document.getElementById("issueTitle").value,
+                  body: document.getElementById("issueBody").value
+                })
+              }
+            );
+
+            alert("Issue created.");
+            repository(username, repoName);
+          } catch (error) {
+            alert(error.message);
+          }
+        });
+    } catch (error) {
+      document.getElementById("repoContent").innerHTML =
+        showError(error.message);
+    }
+  }
+
+  async function logout() {
+    try {
+      if (getToken()) {
+        await api("/api/logout", {
+          method: "POST"
+        });
+      }
+    } catch (error) {
+      console.error(error);
     }
 
-    let starHtml = "";
+    clearAuth();
+    location.href = "/";
+  }
 
-    if(token()){
+  function router() {
+    var path = location.pathname;
 
-      starHtml =
-        '<button ' +
-          'class="btn btnPrimary" ' +
-          'onclick="starRepo(' +
-            Number(r.id) +
-          ')">' +
-          '★ Star' +
-        '</button>';
-
-    }else{
-
-      starHtml =
-        '<a ' +
-          'class="btn btnPrimary" ' +
-          'href="/login">' +
-          'Login to Star' +
-        '</a>';
+    if (path === "/" || path === "") {
+      home();
+      return;
     }
 
-    let issueFormHtml = "";
-
-    if(token()){
-
-      issueFormHtml =
-        '<div ' +
-          'class="panel" ' +
-          'style="margin-top:40px">' +
-
-          '<h2>Create issue</h2>' +
-
-          '<input ' +
-            'id="issueTitle" ' +
-            'class="input" ' +
-            'placeholder="Issue title">' +
-
-          '<textarea ' +
-            'id="issueBody" ' +
-            'class="input" ' +
-            'rows="6" ' +
-            'placeholder="Describe the issue...">' +
-          '</textarea>' +
-
-          '<button ' +
-            'class="btn btnPrimary" ' +
-            'onclick="createIssue(' +
-              Number(r.id) +
-            ')">' +
-            'Open Issue' +
-          '</button>' +
-
-        '</div>';
+    if (path === "/login") {
+      loginPage();
+      return;
     }
 
-    layout(
-      '<section ' +
-        'class="container" ' +
-        'style="padding:60px 0">' +
+    if (path === "/register") {
+      registerPage();
+      return;
+    }
 
-        '<div class="panel">' +
+    if (path === "/dashboard") {
+      dashboard();
+      return;
+    }
 
-          '<div class="muted">' +
-            escapeHtml(
-              r.owner
-            ) +
-          '</div>' +
+    if (path === "/repos") {
+      repositories();
+      return;
+    }
 
-          '<h1>' +
-            escapeHtml(
-              r.name
-            ) +
-          '</h1>' +
-
-          '<p class="muted">' +
-            escapeHtml(
-              r.description ||
-              "No description"
-            ) +
-          '</p>' +
-
-          '<div class="stats">' +
-            '<span>★ ' +
-              r.stars +
-            '</span>' +
-
-            '<span>' +
-              escapeHtml(
-                r.visibility
-              ) +
-            '</span>' +
-
-            '<span>' +
-              escapeHtml(
-                r.default_branch
-              ) +
-            '</span>' +
-          '</div>' +
-
-          '<div ' +
-            'class="actions" ' +
-            'style="justify-content:flex-start">' +
-            starHtml +
-          '</div>' +
-
-        '</div>' +
-
-        '<h2 style="margin-top:40px">' +
-          'Files' +
-        '</h2>' +
-
-        '<div class="grid">' +
-          filesHtml +
-        '</div>' +
-
-        '<h2 style="margin-top:45px">' +
-          'Commits' +
-        '</h2>' +
-
-        '<div class="grid">' +
-          commitsHtml +
-        '</div>' +
-
-        '<h2 style="margin-top:45px">' +
-          'Issues' +
-        '</h2>' +
-
-        '<div class="grid">' +
-          issuesHtml +
-        '</div>' +
-
-        issueFormHtml +
-
-      '</section>'
+    var repoMatch = path.match(
+      /^\\/repo\\/([^/]+)\\/([^/]+)$/
     );
 
-  }catch(error){
-
-    layout(
-      '<section ' +
-        'class="container" ' +
-        'style="padding:80px 0">' +
-
-        '<div class="alert">' +
-          escapeHtml(
-            error.message
-          ) +
-        '</div>' +
-
-      '</section>'
-    );
-  }
-}
-
-/* =========================================================
-   STAR
-========================================================= */
-
-async function starRepo(id){
-
-  try{
-
-    await api(
-      "/repos/" +
-      id +
-      "/star",
-      {
-        method:"POST"
-      }
-    );
-
-    alert(
-      "Star updated!"
-    );
-
-    location.reload();
-
-  }catch(error){
-
-    alert(
-      error.message
-    );
-  }
-}
-
-/* =========================================================
-   CREATE ISSUE
-========================================================= */
-
-async function createIssue(id){
-
-  const titleElement =
-    document.getElementById(
-      "issueTitle"
-    );
-
-  const bodyElement =
-    document.getElementById(
-      "issueBody"
-    );
-
-  if(!titleElement){
-    return;
-  }
-
-  const title =
-    titleElement.value.trim();
-
-  const body =
-    bodyElement
-      ? bodyElement.value
-      : "";
-
-  if(!title){
-
-    alert(
-      "Issue title required."
-    );
-
-    return;
-  }
-
-  try{
-
-    await api(
-      "/repos/" +
-      id +
-      "/issues",
-      {
-        method:"POST",
-        body:JSON.stringify({
-          title:title,
-          body:body
-        })
-      }
-    );
-
-    alert(
-      "Issue created!"
-    );
-
-    location.reload();
-
-  }catch(error){
-
-    alert(
-      error.message
-    );
-  }
-}
-
-/* =========================================================
-   LOGOUT
-========================================================= */
-
-async function logout(){
-
-  try{
-
-    await api(
-      "/logout",
-      {
-        method:"POST"
-      }
-    );
-
-  }catch(error){
-
-    console.error(
-      error
-    );
-  }
-
-  localStorage.removeItem(
-    "novaix_token"
-  );
-
-  localStorage.removeItem(
-    "novaix_user"
-  );
-
-  location.href = "/";
-}
-
-/* =========================================================
-   ROUTER
-========================================================= */
-
-function router(){
-
-  const p =
-    location.pathname;
-
-  if(p === "/"){
-    home();
-    return;
-  }
-
-  if(p === "/login"){
-    loginPage();
-    return;
-  }
-
-  if(p === "/register"){
-    registerPage();
-    return;
-  }
-
-  if(p === "/dashboard"){
-    dashboard();
-    return;
-  }
-
-  if(p === "/repositories"){
-    repositories();
-    return;
-  }
-
-  if(
-    p.startsWith(
-      "/repo/"
-    )
-  ){
-
-    const parts =
-      p.substring(
-        "/repo/".length
-      )
-      .split("/")
-      .map(
-        function(value){
-          return decodeURIComponent(
-            value
-          );
-        }
-      );
-
-    if(parts.length >= 2){
-
+    if (repoMatch) {
       repository(
-        parts[0],
-        parts[1]
+        decodeURIComponent(repoMatch[1]),
+        decodeURIComponent(repoMatch[2])
       );
-
       return;
     }
+
+    home();
   }
 
-  home();
-}
+  document
+    .getElementById("navLogout")
+    .addEventListener("click", function (event) {
+      event.preventDefault();
+      logout();
+    });
 
-/* =========================================================
-   SPA NAVIGATION
-========================================================= */
+  document.addEventListener("click", function (event) {
+    var link = event.target.closest("a");
 
-document.addEventListener(
-  "click",
-  function(e){
+    if (!link) {
+      return;
+    }
 
-    const a =
-      e.target.closest(
-        "a"
-      );
+    var href = link.getAttribute("href");
 
-    if(!a) return;
-
-    const href =
-      a.getAttribute(
-        "href"
-      );
-
-    if(
+    if (
       !href ||
-      !href.startsWith("/") ||
-      href.startsWith("//")
-    ){
+      href.startsWith("http") ||
+      href.startsWith("#") ||
+      href.startsWith("mailto:")
+    ) {
       return;
     }
 
-    if(
-      a.target === "_blank" ||
-      e.ctrlKey ||
-      e.metaKey ||
-      e.shiftKey ||
-      e.altKey
-    ){
+    if (!href.startsWith("/")) {
       return;
     }
 
-    e.preventDefault();
+    event.preventDefault();
 
-    history.pushState(
-      {},
-      "",
-      href
-    );
-
+    history.pushState({}, "", href);
     router();
-  }
-);
+  });
 
-window.addEventListener(
-  "popstate",
-  router
-);
+  window.addEventListener("popstate", router);
 
-router();
-
+  updateNav();
+  router();
+})();
 </script>
 
 </body>
@@ -3337,108 +2418,95 @@ router();
    FRONTEND FALLBACK
 ========================================================= */
 
-app.get(
-  "/{*splat}",
-  function(req, res){
-
-    if(
-      req.path.startsWith(
-        "/api/"
-      )
-    ){
-      return res.status(404).json({
-        error:
-          "API endpoint not found"
-      });
-    }
-
-    return res
-      .type("html")
-      .send(html);
+app.use((req, res) => {
+  if (req.path.startsWith("/api/")) {
+    return res.status(404).json({
+      error: "API endpoint not found."
+    });
   }
-);
+
+  res.status(200).type("html").send(html);
+});
 
 /* =========================================================
    ERROR HANDLER
 ========================================================= */
 
-app.use(
-  function(error, req, res, next){
+app.use((error, req, res, next) => {
+  console.error("UNHANDLED ERROR:", error);
 
-    console.error(
-      "Unhandled server error:",
-      error
-    );
-
-    if(res.headersSent){
-      return next(error);
-    }
-
-    return res.status(500).json({
-      error:
-        "Internal server error."
-    });
+  if (res.headersSent) {
+    return next(error);
   }
-);
+
+  res.status(500).json({
+    error: "Internal server error."
+  });
+});
 
 /* =========================================================
    START
 ========================================================= */
 
-async function start(){
-
-  try{
-
+async function start() {
+  try {
     await initDatabase();
 
-  }catch(error){
-
-    console.error(
-      "Database initialization failed:",
-      error.message
-    );
-
-    console.error(
-      "Server will continue running."
-    );
-  }
-
-  app.listen(
-    PORT,
-    "0.0.0.0",
-    function(){
-
+    const server = app.listen(PORT, "0.0.0.0", () => {
       console.log("");
-      console.log(
-        "================================="
-      );
-      console.log(
-        "        NOVAIX SERVER"
-      );
-      console.log(
-        "================================="
-      );
-      console.log(
-        "Port:",
-        PORT
-      );
-      console.log(
-        "Environment:",
-        process.env.NODE_ENV ||
-        "production"
-      );
-      console.log(
-        "Database:",
-        DATABASE_URL
-          ? "CONFIGURED"
-          : "MISSING"
-      );
-      console.log(
-        "================================="
-      );
+      console.log("=================================");
+      console.log("        NOVAIX SERVER");
+      console.log("=================================");
+      console.log("Port:", PORT);
+      console.log("Environment:", NODE_ENV);
+      console.log("Database:", pool ? "CONFIGURED" : "MISSING");
+      console.log("=================================");
       console.log("");
+    });
+
+    function shutdown(signal) {
+      console.log(signal + " received. Shutting down...");
+
+      server.close(async () => {
+        if (pool) {
+          try {
+            await pool.end();
+          } catch (error) {
+            console.error("Database shutdown error:", error.message);
+          }
+        }
+
+        process.exit(0);
+      });
     }
-  );
+
+    process.on("SIGTERM", function () {
+      shutdown("SIGTERM");
+    });
+
+    process.on("SIGINT", function () {
+      shutdown("SIGINT");
+    });
+  } catch (error) {
+    console.error("STARTUP ERROR:", error);
+
+    /*
+      Serverni butunlay yiqitmaslik uchun:
+      DATABASE_URL noto'g'ri bo'lsa ham health/server javob berishi mumkin.
+    */
+
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log("");
+      console.log("=================================");
+      console.log("        NOVAIX SERVER");
+      console.log("=================================");
+      console.log("Port:", PORT);
+      console.log("Environment:", NODE_ENV);
+      console.log("Database: ERROR");
+      console.log("=================================");
+      console.log("");
+    });
+  }
 }
 
 start();
